@@ -177,6 +177,11 @@ impl<'a> super::Parser<'a> {
                     self.read_prim(&prim_path, &mut children, data)
                         .context("Unable to read nested primitive")?;
                 }
+                Token::VariantSet => {
+                    self.fetch_next()?;
+                    self.read_variant_set(&prim_path, data)
+                        .context("Unable to read variant set")?;
+                }
                 Token::Rel => {
                     self.fetch_next()?;
                     self.read_relationship(&prim_path, &mut properties, data)
@@ -392,5 +397,111 @@ impl<'a> super::Parser<'a> {
             .try_as_path_ref()
             .ok_or_else(|| anyhow!("Path reference expected, got {token:?}"))?;
         sdf::Path::new(path_str)
+    }
+
+    /// Parse a variantSet block within a prim.
+    ///
+    /// Syntax: `variantSet "name" = { "variant1" { ... } "variant2" { ... } }`
+    pub(super) fn read_variant_set(
+        &mut self,
+        prim_path: &sdf::Path,
+        data: &mut HashMap<sdf::Path, sdf::Spec>,
+    ) -> Result<()> {
+        // Get the variant set name
+        let name_token = self.fetch_next()?;
+        let variant_set_name = name_token
+            .clone()
+            .try_as_string()
+            .ok_or_else(|| anyhow!("Expected variant set name string, got {name_token:?}"))?;
+
+        self.ensure_pun('=').context("Expected '=' after variant set name")?;
+        self.ensure_pun('{').context("Expected '{' to start variant set block")?;
+
+        // Parse each variant within the set
+        let mut variant_children = Vec::new();
+
+        loop {
+            // Check for closing brace
+            if self.is_next(Token::Punctuation('}')) {
+                self.fetch_next()?;
+                break;
+            }
+
+            // Get the variant name (a string)
+            let variant_token = self.fetch_next()?;
+            let variant_name = variant_token
+                .clone()
+                .try_as_string()
+                .ok_or_else(|| anyhow!("Expected variant name string, got {variant_token:?}"))?;
+
+            variant_children.push(variant_name.to_string());
+
+            // Create the variant path: /Prim{variantSet=variant}
+            let variant_path = prim_path.append_variant_selection(variant_set_name, variant_name)?;
+
+            // Create a spec for this variant
+            let mut variant_spec = sdf::Spec::new(sdf::SpecType::Variant);
+
+            // Parse the variant body
+            self.ensure_pun('{').context("Expected '{' to start variant body")?;
+
+            let mut variant_properties = Vec::new();
+            let mut variant_prim_children = Vec::new();
+
+            loop {
+                let next = self
+                    .peek_next()
+                    .context("Unexpected end of variant body")?
+                    .as_ref()
+                    .map_err(|e| anyhow!("{e:?}"))?;
+
+                match next {
+                    Token::Punctuation('}') => {
+                        self.fetch_next()?;
+                        break;
+                    }
+                    Token::Def | Token::Over | Token::Class => {
+                        self.read_prim(&variant_path, &mut variant_prim_children, data)
+                            .context("Unable to read nested prim in variant")?;
+                    }
+                    Token::Rel => {
+                        self.fetch_next()?;
+                        self.read_relationship(&variant_path, &mut variant_properties, data)
+                            .context("Unable to read relationship in variant")?;
+                    }
+                    _ => {
+                        self.read_attribute(&variant_path, &mut variant_properties, data)
+                            .context("Unable to read attribute in variant")?;
+                    }
+                }
+            }
+
+            variant_spec.add(ChildrenKey::PrimChildren, sdf::Value::TokenVec(variant_prim_children));
+            variant_spec.add(ChildrenKey::PropertyChildren, sdf::Value::TokenVec(variant_properties));
+            data.insert(variant_path, variant_spec);
+        }
+
+        // Create a spec for the variant set itself
+        let mut variant_set_spec = sdf::Spec::new(sdf::SpecType::VariantSet);
+        variant_set_spec.add(ChildrenKey::VariantChildren, sdf::Value::TokenVec(variant_children));
+
+        // Store under the prim path with variantSet marker
+        // The path format for variant sets is typically stored differently, but for now
+        // we store metadata on the prim's variantSetChildren
+        // Get or create the prim spec to track variant set children
+        if let Some(prim_spec) = data.get_mut(prim_path) {
+            // Get existing variantSetChildren or create new
+            let existing = prim_spec
+                .fields
+                .get(ChildrenKey::VariantSetChildren.as_str())
+                .and_then(|v| v.clone().try_as_token_vec())
+                .unwrap_or_default();
+
+            let mut set_children = existing;
+            set_children.push(variant_set_name.to_string());
+            prim_spec.add(ChildrenKey::VariantSetChildren, sdf::Value::TokenVec(set_children));
+        }
+
+        Ok(())
     }
 }

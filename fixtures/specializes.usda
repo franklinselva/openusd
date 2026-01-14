@@ -1,0 +1,44 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    doc = "Test fixture for specializes composition arc"
+)
+
+# Base prim that will be specialized
+def Xform "BasePrim"
+{
+    double baseValue = 1.0
+    string description = "base description"
+}
+
+# Another base prim
+def Xform "AnotherBase"
+{
+    double anotherValue = 2.0
+    string description = "another description"
+}
+
+def Xform "World"
+{
+    # Prim that specializes BasePrim
+    def Mesh "SpecializingMesh" (
+        specializes = </BasePrim>
+    )
+    {
+        # Local opinion overrides specialized description
+        string description = "specialized description"
+        # baseValue should come from specializes
+    }
+
+    # Prim that both inherits and specializes
+    # Inherits should win over specializes
+    def Mesh "InheritAndSpecialize" (
+        inherits = </AnotherBase>
+        specializes = </BasePrim>
+    )
+    {
+        # description should come from inherits (AnotherBase), not specializes (BasePrim)
+        # anotherValue should come from inherits
+        # baseValue should come from specializes
+    }
+}

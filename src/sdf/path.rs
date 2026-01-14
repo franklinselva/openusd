@@ -147,6 +147,18 @@ impl Path {
         &self.path
     }
 
+    /// Append a variant selection to the path.
+    ///
+    /// Creates paths like `/Prim{variantSet=variant}`.
+    pub fn append_variant_selection(&self, variant_set: &str, variant: &str) -> Result<Path> {
+        ensure!(!self.is_property_path(), "Cannot append variant selection to property path");
+        ensure!(!variant_set.is_empty(), "Variant set name cannot be empty");
+        ensure!(!variant.is_empty(), "Variant name cannot be empty");
+
+        let new_path = format!("{}{{{variant_set}={variant}}}", self.path);
+        Ok(Path { path: new_path })
+    }
+
     /// Validate identifier
     ///
     /// Rules are:

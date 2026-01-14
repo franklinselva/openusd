@@ -9,6 +9,52 @@ use super::value::types::{keyword_lexeme, Type};
 
 /// Metadata and dictionary parsing functions.
 impl<'a> super::Parser<'a> {
+    /// Parse a variant selection map `{ string variantName = "selectedVariant" }`.
+    ///
+    /// The map contains typed entries in the form `string key = "value"`.
+    pub(super) fn parse_variant_selection_map(&mut self) -> Result<HashMap<String, String>> {
+        self.ensure_pun('{').context("Variant selection must start with {")?;
+
+        let mut selections = HashMap::new();
+
+        loop {
+            // Check for closing brace
+            if self.is_next(Token::Punctuation('}')) {
+                self.fetch_next()?;
+                break;
+            }
+
+            // Expect "string" type hint
+            let type_token = self.fetch_next()?;
+            match type_token {
+                Token::Identifier("string") => {}
+                other => bail!("Expected 'string' type in variant selection, got: {other:?}"),
+            }
+
+            // Get the variant set name
+            let name_token = self.fetch_next()?;
+            let name = match name_token {
+                Token::Identifier(s) | Token::NamespacedIdentifier(s) => s.to_owned(),
+                other => bail!("Expected variant set name identifier, got: {other:?}"),
+            };
+
+            self.ensure_pun('=')?;
+
+            // Get the selected variant value
+            let value = self.parse_token::<String>().context("Expected variant selection value")?;
+
+            selections.insert(name, value);
+
+            // Handle optional trailing comma
+            if self.is_next(Token::Punctuation('}')) {
+                self.fetch_next()?;
+                break;
+            }
+        }
+
+        Ok(selections)
+    }
+
     /// Parse the metadata block attached to an attribute and stash entries on the spec.
     pub(super) fn parse_property_metadata(&mut self, spec: &mut sdf::Spec) -> Result<()> {
         self.ensure_pun('(')?;
@@ -200,6 +246,9 @@ impl<'a> super::Parser<'a> {
             Token::References => FieldKey::References.as_str(),
             Token::Payload => FieldKey::Payload.as_str(),
             Token::Inherits => FieldKey::InheritPaths.as_str(),
+            Token::Specializes => FieldKey::Specializes.as_str(),
+            Token::Variants => FieldKey::VariantSelection.as_str(),
+            Token::VariantSets => FieldKey::VariantSetNames.as_str(),
             Token::CustomData => "customData",
             Token::Doc => FieldKey::Documentation.as_str(),
             other => bail!("Unexpected metadata name token: {other:?}"),
@@ -249,6 +298,23 @@ impl<'a> super::Parser<'a> {
                     .context("Unable to build inherits listOp")?;
                 spec.add(FieldKey::InheritPaths, sdf::Value::PathListOp(list_op));
             }
+            n if n == FieldKey::Specializes.as_str() => {
+                // Specializes uses the same path syntax as inherits
+                let paths = if self.is_next(Token::Punctuation('[')) {
+                    let mut collected = Vec::new();
+                    self.parse_array_fn(|this| {
+                        collected.push(this.parse_inherit_path()?);
+                        Ok(())
+                    })?;
+                    collected
+                } else {
+                    vec![self.parse_inherit_path()?]
+                };
+                let list_op = self
+                    .apply_list_op(list_op, paths)
+                    .context("Unable to build specializes listOp")?;
+                spec.add(FieldKey::Specializes, sdf::Value::PathListOp(list_op));
+            }
             n if n == FieldKey::Kind.as_str() => {
                 ensure!(list_op.is_none(), "kind metadata does not support list ops");
                 let value = self.parse_token::<String>().context("Unable to parse kind metadata")?;
@@ -265,6 +331,34 @@ impl<'a> super::Parser<'a> {
                 ensure!(list_op.is_none(), "doc metadata does not support list ops");
                 let value = self.parse_token::<String>().context("Unable to parse doc metadata")?;
                 spec.add(FieldKey::Documentation, sdf::Value::String(value));
+            }
+            n if n == FieldKey::VariantSelection.as_str() => {
+                ensure!(
+                    list_op.is_none(),
+                    "variants metadata does not support list ops"
+                );
+                let selections = self
+                    .parse_variant_selection_map()
+                    .context("Unable to parse variant selections")?;
+                spec.add(FieldKey::VariantSelection, sdf::Value::VariantSelectionMap(selections));
+            }
+            n if n == FieldKey::VariantSetNames.as_str() => {
+                // variantSets can be a single string or array of strings, with optional list ops
+                let names = if self.is_next(Token::Punctuation('[')) {
+                    let mut collected = Vec::new();
+                    self.parse_array_fn(|this| {
+                        let name = this.parse_token::<String>().context("Expected variant set name string")?;
+                        collected.push(name);
+                        Ok(())
+                    })?;
+                    collected
+                } else {
+                    vec![self.parse_token::<String>().context("Expected variant set name")?]
+                };
+                let list_op = self
+                    .apply_list_op(list_op, names)
+                    .context("Unable to build variantSetNames listOp")?;
+                spec.add(FieldKey::VariantSetNames, sdf::Value::StringListOp(list_op));
             }
             other => bail!("Unsupported prim metadata: {other}"),
         }

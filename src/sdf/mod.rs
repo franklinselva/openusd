@@ -100,6 +100,28 @@ impl LayerOffset {
     pub fn is_valid(&self) -> bool {
         self.offset.is_finite() && self.scale.is_finite()
     }
+
+    /// Check if this is an identity offset (no transformation).
+    #[inline]
+    pub fn is_identity(&self) -> bool {
+        (self.offset - 0.0).abs() < f64::EPSILON && (self.scale - 1.0).abs() < f64::EPSILON
+    }
+
+    /// Apply this layer offset to a time value.
+    ///
+    /// Formula: mapped_time = offset + (time * scale)
+    #[inline]
+    pub fn apply(&self, time: f64) -> f64 {
+        self.offset + (time * self.scale)
+    }
+
+    /// Apply the inverse of this layer offset to a time value.
+    ///
+    /// Formula: original_time = (time - offset) / scale
+    #[inline]
+    pub fn apply_inverse(&self, time: f64) -> f64 {
+        (time - self.offset) / self.scale
+    }
 }
 
 /// Represents a payload and all its meta data.
@@ -201,7 +223,7 @@ pub trait AbstractData {
     fn list(&self, path: &Path) -> Option<Vec<String>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Spec {
     /// Specifies the type of an object.
     pub ty: SpecType,

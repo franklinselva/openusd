@@ -1,0 +1,50 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    doc = "Test fixture for inherits composition arc"
+)
+
+# Base class that will be inherited
+class "_MaterialBase"
+{
+    double roughness = 0.5
+    double metallic = 0.0
+    string shader = "UsdPreviewSurface"
+}
+
+# Another base class
+class "_TransformBase"
+{
+    double3 xformOp:translate = (0, 0, 0)
+    double3 xformOp:scale = (1, 1, 1)
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+}
+
+def Xform "World"
+{
+    # Child that inherits from _MaterialBase
+    def Mesh "MetalCube" (
+        inherits = </_MaterialBase>
+    )
+    {
+        # Local opinion overrides inherited roughness
+        double roughness = 0.2
+        # metallic and shader should be inherited
+    }
+
+    # Child that inherits from multiple classes
+    def Mesh "TransformedMetal" (
+        inherits = [</_MaterialBase>, </_TransformBase>]
+    )
+    {
+        # Override translate from _TransformBase
+        double3 xformOp:translate = (5, 0, 0)
+        # Should inherit: metallic, shader, scale, xformOpOrder
+    }
+
+    # Child that doesn't inherit anything (control case)
+    def Mesh "PlainCube"
+    {
+        double roughness = 1.0
+    }
+}

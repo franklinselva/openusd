@@ -68,8 +68,15 @@ impl ComposedLayer {
 
         // Check for sublayers in the pseudo-root
         let sublayer_paths = Self::extract_sublayer_paths(&specs);
+        let sublayer_offsets = Self::extract_sublayer_offsets(&specs);
 
         if sublayer_paths.is_empty() {
+            // Apply LIVRPS composition arcs even without sublayers
+            let mut specs = specs;
+            Self::compose_inherits(&mut specs);
+            Self::compose_variants(&mut specs);
+            Self::compose_specializes(&mut specs);
+
             return Ok(ComposedLayer {
                 specs,
                 source_path: path.to_path_buf(),
@@ -83,17 +90,32 @@ impl ComposedLayer {
         let mut all_composed_layers = Vec::new();
 
         // Process sublayers from weakest to strongest (reverse order)
-        for sublayer_path in sublayer_paths.iter().rev() {
+        // Pair each sublayer path with its corresponding offset
+        let sublayer_with_offsets: Vec<_> = sublayer_paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let offset = sublayer_offsets
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_default();
+                (path, offset)
+            })
+            .collect();
+
+        for (sublayer_path, layer_offset) in sublayer_with_offsets.iter().rev() {
             let resolved_path = match Self::resolve_sublayer_path(sublayer_path, base_dir) {
                 Ok(p) => p,
-                Err(_) => continue, // Skip unresolvable paths
+                Err(_) => continue,
             };
 
             match Self::open_recursive(&resolved_path, visited) {
                 Ok(sublayer) => {
                     // Merge sublayer specs into composed specs
                     // Later (stronger) layers will override
-                    for (path, spec) in sublayer.specs {
+                    for (path, mut spec) in sublayer.specs {
+                        // Apply layer offset to time samples in this spec
+                        Self::apply_layer_offset_to_spec(&mut spec, layer_offset);
                         composed_specs.insert(path, spec);
                     }
 
@@ -111,6 +133,14 @@ impl ComposedLayer {
         }
 
         all_composed_layers.push(path.to_path_buf());
+
+        // Apply LIVRPS composition arcs
+        // I - Inherits (after Local opinions from sublayers)
+        Self::compose_inherits(&mut composed_specs);
+        // V - Variants (selected variant content)
+        Self::compose_variants(&mut composed_specs);
+        // S - Specializes (weakest arc)
+        Self::compose_specializes(&mut composed_specs);
 
         Ok(ComposedLayer {
             specs: composed_specs,
@@ -179,6 +209,40 @@ impl ComposedLayer {
         }
     }
 
+    /// Extract sublayer offsets from the pseudo-root spec.
+    fn extract_sublayer_offsets(specs: &HashMap<SdfPath, Spec>) -> Vec<crate::sdf::LayerOffset> {
+        let root_path = SdfPath::abs_root();
+
+        let Some(root_spec) = specs.get(&root_path) else {
+            return vec![];
+        };
+
+        let Some(offsets_value) = root_spec.fields.get(FieldKey::SubLayerOffsets.as_str()) else {
+            return vec![];
+        };
+
+        match offsets_value {
+            Value::LayerOffsetVec(offsets) => offsets.clone(),
+            _ => vec![],
+        }
+    }
+
+    /// Apply a layer offset to all time samples in a spec.
+    fn apply_layer_offset_to_spec(spec: &mut Spec, layer_offset: &crate::sdf::LayerOffset) {
+        if layer_offset.is_identity() {
+            return;
+        }
+
+        for value in spec.fields.values_mut() {
+            if let Value::TimeSamples(samples) = value {
+                *samples = samples
+                    .iter()
+                    .map(|(time, val)| (layer_offset.apply(*time), val.clone()))
+                    .collect();
+            }
+        }
+    }
+
     /// Resolve a sublayer path relative to the base directory.
     fn resolve_sublayer_path(sublayer_path: &str, base_dir: &Path) -> Result<PathBuf> {
         // Clean up the path (remove @@ markers if present from asset paths)
@@ -221,6 +285,401 @@ impl ComposedLayer {
             None => {
                 // No existing spec, just insert
                 composed.insert(path, stronger_spec);
+            }
+        }
+    }
+
+    /// Extract inherit paths from a prim's spec.
+    ///
+    /// Returns paths from the PathListOp, combining explicit, prepended, appended, and added items.
+    fn extract_inherit_paths(spec: &Spec) -> Vec<SdfPath> {
+        let Some(value) = spec.fields.get(FieldKey::InheritPaths.as_str()) else {
+            return vec![];
+        };
+
+        let Some(list_op) = value.clone().try_as_path_list_op() else {
+            return vec![];
+        };
+
+        // Combine all items from the list op
+        // Order: explicit items take precedence, then prepended, then added, then appended
+        let mut paths = Vec::new();
+
+        if list_op.explicit {
+            paths.extend(list_op.explicit_items);
+        } else {
+            paths.extend(list_op.prepended_items);
+            paths.extend(list_op.added_items);
+            paths.extend(list_op.appended_items);
+        }
+
+        // Filter out deleted items
+        paths.retain(|p| !list_op.deleted_items.contains(p));
+
+        paths
+    }
+
+    /// Compose inherits arcs for all prims in the specs.
+    ///
+    /// Inherits are weaker than local opinions but stronger than references.
+    /// For each prim with an `inheritPaths` field, copy fields from the
+    /// inherited class prims that don't already exist on the inheriting prim.
+    fn compose_inherits(specs: &mut HashMap<SdfPath, Spec>) {
+        // Collect all prims that have inherits (to avoid borrowing issues)
+        let prims_with_inherits: Vec<(SdfPath, Vec<SdfPath>)> = specs
+            .iter()
+            .filter(|(_, spec)| spec.ty == SpecType::Prim)
+            .filter_map(|(path, spec)| {
+                let inherit_paths = Self::extract_inherit_paths(spec);
+                if inherit_paths.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), inherit_paths))
+                }
+            })
+            .collect();
+
+        // Process each prim with inherits
+        for (prim_path, inherit_paths) in prims_with_inherits {
+            // Collect fields from inherited classes (later inherits are weaker)
+            let mut inherited_fields: HashMap<String, Value> = HashMap::new();
+
+            // Process inherits in order (first in list is strongest)
+            for class_path in inherit_paths.iter() {
+                if let Some(class_spec) = specs.get(class_path) {
+                    // Copy fields from class to inherited_fields
+                    // Earlier (stronger) inherits will override later ones
+                    for (key, value) in &class_spec.fields {
+                        // Skip composition-specific fields
+                        if key == FieldKey::InheritPaths.as_str()
+                            || key == FieldKey::Specifier.as_str()
+                            || key == FieldKey::TypeName.as_str()
+                        {
+                            continue;
+                        }
+                        inherited_fields.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+
+            // Apply inherited fields to the prim (local opinions win)
+            if let Some(prim_spec) = specs.get_mut(&prim_path) {
+                for (key, value) in inherited_fields {
+                    // Only insert if prim doesn't already have this field (local wins)
+                    prim_spec.fields.entry(key).or_insert(value);
+                }
+            }
+
+            // Also inherit child properties (attributes/relationships) from class prims
+            Self::compose_inherited_properties(specs, &prim_path, &inherit_paths);
+        }
+    }
+
+    /// Compose inherited properties (attributes and relationships) from class prims.
+    ///
+    /// This handles properties defined under class prims that should be inherited
+    /// by prims that inherit from those classes.
+    fn compose_inherited_properties(
+        specs: &mut HashMap<SdfPath, Spec>,
+        prim_path: &SdfPath,
+        inherit_paths: &[SdfPath],
+    ) {
+        // Collect all property paths from inherited classes
+        let mut inherited_properties: Vec<(SdfPath, Spec)> = Vec::new();
+
+        // Process inherits in order (first in list is strongest)
+        for class_path in inherit_paths.iter() {
+            // Find all properties under this class
+            let class_prefix = class_path.as_str().to_string() + ".";
+            for (path, spec) in specs.iter() {
+                if path.as_str().starts_with(&class_prefix) {
+                    // This is a property of the class
+                    let prop_name = &path.as_str()[class_prefix.len()..];
+                    // Create the corresponding path under the inheriting prim
+                    if let Ok(new_path) = prim_path.append_property(prop_name) {
+                        inherited_properties.push((new_path, spec.clone()));
+                    }
+                }
+            }
+        }
+
+        // Apply inherited properties (local wins)
+        for (prop_path, prop_spec) in inherited_properties {
+            specs.entry(prop_path).or_insert(prop_spec);
+        }
+    }
+
+    /// Extract specializes paths from a prim's spec.
+    ///
+    /// Returns paths from the PathListOp, combining explicit, prepended, appended, and added items.
+    fn extract_specialize_paths(spec: &Spec) -> Vec<SdfPath> {
+        let Some(value) = spec.fields.get(FieldKey::Specializes.as_str()) else {
+            return vec![];
+        };
+
+        let Some(list_op) = value.clone().try_as_path_list_op() else {
+            return vec![];
+        };
+
+        // Combine all items from the list op
+        let mut paths = Vec::new();
+
+        if list_op.explicit {
+            paths.extend(list_op.explicit_items);
+        } else {
+            paths.extend(list_op.prepended_items);
+            paths.extend(list_op.added_items);
+            paths.extend(list_op.appended_items);
+        }
+
+        // Filter out deleted items
+        paths.retain(|p| !list_op.deleted_items.contains(p));
+
+        paths
+    }
+
+    /// Compose specializes arcs for all prims in the specs.
+    ///
+    /// Specializes is the weakest arc in LIVRPS ordering.
+    /// For each prim with a `specializes` field, copy fields from the
+    /// specialized prims that don't already exist on the specializing prim.
+    fn compose_specializes(specs: &mut HashMap<SdfPath, Spec>) {
+        // Collect all prims that have specializes (to avoid borrowing issues)
+        let prims_with_specializes: Vec<(SdfPath, Vec<SdfPath>)> = specs
+            .iter()
+            .filter(|(_, spec)| spec.ty == SpecType::Prim)
+            .filter_map(|(path, spec)| {
+                let specialize_paths = Self::extract_specialize_paths(spec);
+                if specialize_paths.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), specialize_paths))
+                }
+            })
+            .collect();
+
+        // Process each prim with specializes
+        for (prim_path, specialize_paths) in prims_with_specializes {
+            // Collect fields from specialized prims
+            let mut specialized_fields: HashMap<String, Value> = HashMap::new();
+
+            // Process specializes in order (first in list is strongest among specializes)
+            for spec_path in specialize_paths.iter() {
+                if let Some(spec_spec) = specs.get(spec_path) {
+                    for (key, value) in &spec_spec.fields {
+                        // Skip composition-specific fields
+                        if key == FieldKey::Specializes.as_str()
+                            || key == FieldKey::InheritPaths.as_str()
+                            || key == FieldKey::Specifier.as_str()
+                            || key == FieldKey::TypeName.as_str()
+                        {
+                            continue;
+                        }
+                        specialized_fields.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+
+            // Apply specialized fields to the prim (everything else wins over specializes)
+            if let Some(prim_spec) = specs.get_mut(&prim_path) {
+                for (key, value) in specialized_fields {
+                    // Only insert if prim doesn't already have this field
+                    prim_spec.fields.entry(key).or_insert(value);
+                }
+            }
+
+            // Also specialize child properties
+            Self::compose_specialized_properties(specs, &prim_path, &specialize_paths);
+        }
+    }
+
+    /// Compose specialized properties (attributes and relationships) from specialized prims.
+    fn compose_specialized_properties(
+        specs: &mut HashMap<SdfPath, Spec>,
+        prim_path: &SdfPath,
+        specialize_paths: &[SdfPath],
+    ) {
+        // Collect all property paths from specialized prims
+        let mut specialized_properties: Vec<(SdfPath, Spec)> = Vec::new();
+
+        // Process specializes in order (first in list is strongest)
+        for spec_path in specialize_paths.iter() {
+            let spec_prefix = spec_path.as_str().to_string() + ".";
+            for (path, spec) in specs.iter() {
+                if path.as_str().starts_with(&spec_prefix) {
+                    let prop_name = &path.as_str()[spec_prefix.len()..];
+                    if let Ok(new_path) = prim_path.append_property(prop_name) {
+                        specialized_properties.push((new_path, spec.clone()));
+                    }
+                }
+            }
+        }
+
+        // Apply specialized properties (everything else wins)
+        for (prop_path, prop_spec) in specialized_properties {
+            specs.entry(prop_path).or_insert(prop_spec);
+        }
+    }
+
+    /// Extract variant selections from a prim's spec.
+    ///
+    /// Returns a map of variant set name to selected variant.
+    fn extract_variant_selections(spec: &Spec) -> HashMap<String, String> {
+        let Some(value) = spec.fields.get(FieldKey::VariantSelection.as_str()) else {
+            return HashMap::new();
+        };
+
+        match value {
+            Value::VariantSelectionMap(map) => map.clone(),
+            _ => HashMap::new(),
+        }
+    }
+
+    /// Compose variant arcs for all prims in the specs.
+    ///
+    /// For each prim with variant selections, compose fields from the selected
+    /// variant into the prim. This includes properties and child prims defined
+    /// within the variant.
+    fn compose_variants(specs: &mut HashMap<SdfPath, Spec>) {
+        // Collect all prims that have variant selections
+        let prims_with_variants: Vec<(SdfPath, HashMap<String, String>)> = specs
+            .iter()
+            .filter(|(_, spec)| spec.ty == SpecType::Prim)
+            .filter_map(|(path, spec)| {
+                let selections = Self::extract_variant_selections(spec);
+                if selections.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), selections))
+                }
+            })
+            .collect();
+
+        // Process each prim with variants
+        for (prim_path, selections) in prims_with_variants {
+            // Process each variant selection
+            for (variant_set, selected_variant) in selections {
+                // Build the variant path: /Prim{variantSet=variant}
+                let variant_path = match prim_path.append_variant_selection(&variant_set, &selected_variant) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                // Get fields from the variant spec
+                let variant_fields: HashMap<String, Value> = if let Some(variant_spec) = specs.get(&variant_path) {
+                    variant_spec
+                        .fields
+                        .iter()
+                        .filter(|(key, _)| {
+                            // Skip composition-specific fields
+                            *key != FieldKey::Specifier.as_str()
+                                && *key != "primChildren"
+                                && *key != "propertyChildren"
+                        })
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                } else {
+                    continue;
+                };
+
+                // Apply variant fields to the prim (local opinions still win)
+                if let Some(prim_spec) = specs.get_mut(&prim_path) {
+                    for (key, value) in variant_fields {
+                        prim_spec.fields.entry(key).or_insert(value);
+                    }
+                }
+
+                // Compose properties from variant namespace into prim namespace
+                Self::compose_variant_properties(specs, &prim_path, &variant_path);
+
+                // Compose child prims from variant namespace into prim namespace
+                Self::compose_variant_children(specs, &prim_path, &variant_path);
+            }
+        }
+    }
+
+    /// Compose properties from a variant path into the prim path.
+    fn compose_variant_properties(specs: &mut HashMap<SdfPath, Spec>, prim_path: &SdfPath, variant_path: &SdfPath) {
+        // Find all properties under the variant path
+        let variant_prefix = variant_path.as_str().to_string() + ".";
+        let properties_to_add: Vec<(SdfPath, Spec)> = specs
+            .iter()
+            .filter(|(path, _)| path.as_str().starts_with(&variant_prefix))
+            .map(|(path, spec)| {
+                // Extract property name and create new path under prim
+                let prop_name = &path.as_str()[variant_prefix.len()..];
+                let new_path = prim_path.append_property(prop_name).unwrap();
+                (new_path, spec.clone())
+            })
+            .collect();
+
+        // Add properties (local opinions win)
+        for (prop_path, prop_spec) in properties_to_add {
+            specs.entry(prop_path).or_insert(prop_spec);
+        }
+    }
+
+    /// Compose child prims from a variant path into the prim path.
+    fn compose_variant_children(specs: &mut HashMap<SdfPath, Spec>, prim_path: &SdfPath, variant_path: &SdfPath) {
+        // Find all child prims under the variant path (look for paths like /Prim{var=sel}/Child)
+        let variant_str = variant_path.as_str();
+        let child_prefix = format!("{}/", variant_str);
+
+        // Collect paths that are direct children or deeper descendants
+        let prims_to_add: Vec<(SdfPath, Spec)> = specs
+            .iter()
+            .filter(|(path, spec)| {
+                path.as_str().starts_with(&child_prefix) && spec.ty == SpecType::Prim
+            })
+            .map(|(path, spec)| {
+                // Replace the variant prefix with the prim path
+                let relative_path = &path.as_str()[variant_str.len()..];
+                let new_path_str = format!("{}{}", prim_path.as_str(), relative_path);
+                let new_path = SdfPath::new(&new_path_str).unwrap();
+                (new_path, spec.clone())
+            })
+            .collect();
+
+        // Also need to collect properties and other specs under variant children
+        let all_specs_to_add: Vec<(SdfPath, Spec)> = specs
+            .iter()
+            .filter(|(path, _)| path.as_str().starts_with(&child_prefix))
+            .map(|(path, spec)| {
+                let relative_path = &path.as_str()[variant_str.len()..];
+                let new_path_str = format!("{}{}", prim_path.as_str(), relative_path);
+                let new_path = SdfPath::new(&new_path_str).unwrap();
+                (new_path, spec.clone())
+            })
+            .collect();
+
+        // Add all specs (local opinions win)
+        for (path, spec) in all_specs_to_add {
+            specs.entry(path).or_insert(spec);
+        }
+
+        // Update prim children list
+        if !prims_to_add.is_empty() {
+            if let Some(prim_spec) = specs.get_mut(prim_path) {
+                let mut existing_children = prim_spec
+                    .fields
+                    .get("primChildren")
+                    .and_then(|v| v.clone().try_as_token_vec())
+                    .unwrap_or_default();
+
+                for (new_path, _) in &prims_to_add {
+                    // Extract just the child name from the path
+                    if let Some(child_name) = new_path.as_str().strip_prefix(&format!("{}/", prim_path.as_str())) {
+                        // Only add if it's a direct child (no more slashes) and not already present
+                        if !child_name.contains('/')
+                            && !child_name.contains('.')
+                            && !existing_children.contains(&child_name.to_string())
+                        {
+                            existing_children.push(child_name.to_string());
+                        }
+                    }
+                }
+
+                prim_spec.add("primChildren", Value::TokenVec(existing_children));
             }
         }
     }
@@ -562,6 +1021,642 @@ def Xform "Root" {}
         assert!(composed.specs.contains_key(&sdf::path("/Root").unwrap()));
         assert!(composed.specs.contains_key(&sdf::path("/Middle").unwrap()));
         assert!(composed.specs.contains_key(&sdf::path("/Deep").unwrap()));
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_inherits_basic() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("inherits.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+class "_BaseClass"
+{
+    double roughness = 0.5
+    double metallic = 0.0
+    string shader = "UsdPreviewSurface"
+}
+
+def Xform "World"
+{
+    def Mesh "InheritingMesh" (
+        inherits = </_BaseClass>
+    )
+    {
+        double roughness = 0.2
+    }
+
+    def Mesh "PlainMesh"
+    {
+        double roughness = 1.0
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that InheritingMesh exists and has inherited properties
+        let inheriting_path = sdf::path("/World/InheritingMesh").unwrap();
+        assert!(composed.specs.contains_key(&inheriting_path));
+
+        // Check inherited attribute (metallic should be inherited)
+        let metallic_path = sdf::path("/World/InheritingMesh.metallic").unwrap();
+        assert!(
+            composed.specs.contains_key(&metallic_path),
+            "metallic attribute should be inherited from _BaseClass"
+        );
+
+        // Check that local opinion wins (roughness should be 0.2, not 0.5)
+        let roughness_path = sdf::path("/World/InheritingMesh.roughness").unwrap();
+        let roughness_spec = composed.specs.get(&roughness_path).expect("roughness should exist");
+        let default_value = roughness_spec.fields.get("default").expect("default field");
+        match default_value {
+            Value::Double(v) => {
+                assert!(
+                    (*v - 0.2).abs() < 0.001,
+                    "Local roughness (0.2) should win over inherited (0.5), got {}",
+                    v
+                );
+            }
+            _ => panic!("Expected Double, got {:?}", default_value),
+        }
+
+        // Check that PlainMesh doesn't have metallic (no inheritance)
+        let plain_metallic_path = sdf::path("/World/PlainMesh.metallic").unwrap();
+        assert!(
+            !composed.specs.contains_key(&plain_metallic_path),
+            "PlainMesh should not have metallic (no inheritance)"
+        );
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_inherits_multiple_classes() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("multi_inherit.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+class "_ClassA"
+{
+    double valueA = 1.0
+    double shared = 10.0
+}
+
+class "_ClassB"
+{
+    double valueB = 2.0
+    double shared = 20.0
+}
+
+def Mesh "MultiInherit" (
+    inherits = [</_ClassA>, </_ClassB>]
+)
+{
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Should have valueA from _ClassA
+        let value_a_path = sdf::path("/MultiInherit.valueA").unwrap();
+        assert!(composed.specs.contains_key(&value_a_path), "Should inherit valueA");
+
+        // Should have valueB from _ClassB
+        let value_b_path = sdf::path("/MultiInherit.valueB").unwrap();
+        assert!(composed.specs.contains_key(&value_b_path), "Should inherit valueB");
+
+        // shared should come from _ClassA (first in list, stronger)
+        let shared_path = sdf::path("/MultiInherit.shared").unwrap();
+        let shared_spec = composed.specs.get(&shared_path).expect("shared should exist");
+        let default_value = shared_spec.fields.get("default").expect("default field");
+        match default_value {
+            Value::Double(v) => {
+                assert!(
+                    (*v - 10.0).abs() < 0.001,
+                    "_ClassA's shared (10.0) should win over _ClassB's (20.0), got {}",
+                    v
+                );
+            }
+            _ => panic!("Expected Double, got {:?}", default_value),
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_specializes_basic() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("specializes.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "BasePrim"
+{
+    double baseValue = 1.0
+    string description = "base description"
+}
+
+def Mesh "SpecializingMesh" (
+    specializes = </BasePrim>
+)
+{
+    string description = "specialized description"
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that SpecializingMesh has the specialized baseValue
+        let base_value_path = sdf::path("/SpecializingMesh.baseValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&base_value_path),
+            "baseValue should be specialized from BasePrim"
+        );
+
+        // Check that local description wins over specialized
+        let desc_path = sdf::path("/SpecializingMesh.description").unwrap();
+        let desc_spec = composed.specs.get(&desc_path).expect("description should exist");
+        let default_value = desc_spec.fields.get("default").expect("default field");
+        match default_value {
+            Value::String(v) => {
+                assert_eq!(
+                    v, "specialized description",
+                    "Local description should win over specialized"
+                );
+            }
+            _ => panic!("Expected String, got {:?}", default_value),
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_inherits_wins_over_specializes() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("inherit_vs_specialize.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "BasePrim"
+{
+    double baseValue = 1.0
+    string shared = "from base"
+}
+
+class "_InheritClass"
+{
+    double inheritValue = 2.0
+    string shared = "from inherit"
+}
+
+def Mesh "InheritAndSpecialize" (
+    inherits = </_InheritClass>
+    specializes = </BasePrim>
+)
+{
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Should have baseValue from specializes
+        let base_value_path = sdf::path("/InheritAndSpecialize.baseValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&base_value_path),
+            "baseValue should be specialized from BasePrim"
+        );
+
+        // Should have inheritValue from inherits
+        let inherit_value_path = sdf::path("/InheritAndSpecialize.inheritValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&inherit_value_path),
+            "inheritValue should be inherited from _InheritClass"
+        );
+
+        // shared should come from inherits (stronger than specializes)
+        let shared_path = sdf::path("/InheritAndSpecialize.shared").unwrap();
+        let shared_spec = composed.specs.get(&shared_path).expect("shared should exist");
+        let default_value = shared_spec.fields.get("default").expect("default field");
+        match default_value {
+            Value::String(v) => {
+                assert_eq!(
+                    v, "from inherit",
+                    "Inherits should win over specializes for shared field"
+                );
+            }
+            _ => panic!("Expected String, got {:?}", default_value),
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_layer_offset_application() {
+        // Test layer offset directly on specs without parsing USDA
+        use crate::sdf::{LayerOffset, TimeSampleMap};
+
+        let mut spec = sdf::Spec::new(sdf::SpecType::Attribute);
+
+        // Create time samples: 0 -> value0, 10 -> value1, 20 -> value2
+        let original_samples: TimeSampleMap = vec![
+            (0.0, Value::Double(0.0)),
+            (10.0, Value::Double(10.0)),
+            (20.0, Value::Double(20.0)),
+        ];
+        spec.fields
+            .insert("timeSamples".to_string(), Value::TimeSamples(original_samples));
+
+        // Apply layer offset: offset=100, scale=2
+        // Expected: 0 -> 100, 10 -> 120, 20 -> 140
+        let layer_offset = LayerOffset::new(100.0, 2.0);
+        ComposedLayer::apply_layer_offset_to_spec(&mut spec, &layer_offset);
+
+        // Verify the times were transformed
+        if let Some(Value::TimeSamples(samples)) = spec.fields.get("timeSamples") {
+            let times: Vec<f64> = samples.iter().map(|(t, _)| *t).collect();
+            assert!(
+                times.contains(&100.0),
+                "Time 0 should be offset to 100, got {:?}",
+                times
+            );
+            assert!(
+                times.contains(&120.0),
+                "Time 10 should be offset to 120, got {:?}",
+                times
+            );
+            assert!(
+                times.contains(&140.0),
+                "Time 20 should be offset to 140, got {:?}",
+                times
+            );
+        } else {
+            panic!("Expected TimeSamples");
+        }
+    }
+
+    #[test]
+    fn test_sublayer_with_offset_basic() {
+        let temp_dir = create_temp_dir();
+
+        // Create a sublayer with a simple prim
+        let sub_path = temp_dir.join("sublayer.usda");
+        fs::write(
+            &sub_path,
+            r#"#usda 1.0
+
+def Xform "FromSublayer"
+{
+    double value = 42.0
+}
+"#,
+        )
+        .unwrap();
+
+        // Create root layer with sublayer and offset
+        let root_path = temp_dir.join("root.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+(
+    subLayers = [
+        @./sublayer.usda@ (offset = 10; scale = 2)
+    ]
+)
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // The sublayer prim should be in the composed layer
+        let prim_path = sdf::path("/FromSublayer").unwrap();
+        assert!(
+            composed.specs.contains_key(&prim_path),
+            "FromSublayer should exist in composed layer"
+        );
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_layer_offset_is_identity() {
+        use crate::sdf::LayerOffset;
+
+        // Identity offset should not transform
+        let identity = LayerOffset::new(0.0, 1.0);
+        assert!(identity.is_identity());
+        assert_eq!(identity.apply(10.0), 10.0);
+
+        // Non-identity offsets
+        let with_offset = LayerOffset::new(100.0, 1.0);
+        assert!(!with_offset.is_identity());
+        assert_eq!(with_offset.apply(10.0), 110.0);
+
+        let with_scale = LayerOffset::new(0.0, 2.0);
+        assert!(!with_scale.is_identity());
+        assert_eq!(with_scale.apply(10.0), 20.0);
+
+        let with_both = LayerOffset::new(100.0, 2.0);
+        assert!(!with_both.is_identity());
+        assert_eq!(with_both.apply(10.0), 120.0);
+    }
+
+    #[test]
+    fn test_variant_selection_parsing() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("variants.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    variants = {
+        string lodVariant = "high"
+        string colorVariant = "red"
+    }
+    prepend variantSets = ["lodVariant", "colorVariant"]
+)
+{
+    double scale = 1.0
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that Model prim exists
+        let model_path = sdf::path("/Model").unwrap();
+        let model_spec = composed.specs.get(&model_path).expect("Model should exist");
+
+        // Check variant selection is stored
+        let variant_selection = model_spec
+            .fields
+            .get("variantSelection")
+            .expect("variantSelection should exist");
+
+        if let Value::VariantSelectionMap(map) = variant_selection {
+            assert_eq!(map.get("lodVariant"), Some(&"high".to_string()));
+            assert_eq!(map.get("colorVariant"), Some(&"red".to_string()));
+        } else {
+            panic!("Expected VariantSelectionMap, got {:?}", variant_selection);
+        }
+
+        // Check variant set names are stored
+        let variant_set_names = model_spec
+            .fields
+            .get("variantSetNames")
+            .expect("variantSetNames should exist");
+
+        if let Value::StringListOp(list_op) = variant_set_names {
+            assert!(list_op.prepended_items.contains(&"lodVariant".to_string()));
+            assert!(list_op.prepended_items.contains(&"colorVariant".to_string()));
+        } else {
+            panic!("Expected StringListOp, got {:?}", variant_set_names);
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_variant_set_parsing() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("variantset.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model"
+{
+    variantSet "lodVariant" = {
+        "high" {
+            double detail = 100.0
+        }
+        "low" {
+            double detail = 10.0
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that Model prim exists
+        let model_path = sdf::path("/Model").unwrap();
+        assert!(composed.specs.contains_key(&model_path), "Model should exist");
+
+        // Check that variant paths exist
+        let high_path = sdf::path("/Model{lodVariant=high}").unwrap();
+        assert!(
+            composed.specs.contains_key(&high_path),
+            "High variant should exist at {}",
+            high_path
+        );
+
+        let low_path = sdf::path("/Model{lodVariant=low}").unwrap();
+        assert!(
+            composed.specs.contains_key(&low_path),
+            "Low variant should exist at {}",
+            low_path
+        );
+
+        // Check that variant attributes exist
+        let high_detail_path = sdf::path("/Model{lodVariant=high}.detail").unwrap();
+        let high_detail_spec = composed
+            .specs
+            .get(&high_detail_path)
+            .expect("High variant detail attribute should exist");
+        let high_detail_value = high_detail_spec.fields.get("default").expect("default field");
+        match high_detail_value {
+            Value::Double(v) => {
+                assert!((v - 100.0).abs() < 0.001, "High detail should be 100.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", high_detail_value),
+        }
+
+        let low_detail_path = sdf::path("/Model{lodVariant=low}.detail").unwrap();
+        let low_detail_spec = composed
+            .specs
+            .get(&low_detail_path)
+            .expect("Low variant detail attribute should exist");
+        let low_detail_value = low_detail_spec.fields.get("default").expect("default field");
+        match low_detail_value {
+            Value::Double(v) => {
+                assert!((v - 10.0).abs() < 0.001, "Low detail should be 10.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", low_detail_value),
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_variant_set_with_child_prims() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("variant_children.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model"
+{
+    variantSet "lodVariant" = {
+        "high" {
+            def Mesh "HighResMesh"
+            {
+                double size = 100.0
+            }
+        }
+        "low" {
+            def Mesh "LowResMesh"
+            {
+                double size = 10.0
+            }
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that child prims within variants exist
+        let high_mesh_path = sdf::path("/Model{lodVariant=high}/HighResMesh").unwrap();
+        assert!(
+            composed.specs.contains_key(&high_mesh_path),
+            "HighResMesh should exist in high variant"
+        );
+
+        let low_mesh_path = sdf::path("/Model{lodVariant=low}/LowResMesh").unwrap();
+        assert!(
+            composed.specs.contains_key(&low_mesh_path),
+            "LowResMesh should exist in low variant"
+        );
+
+        // Check attributes on child prims
+        let high_size_path = sdf::path("/Model{lodVariant=high}/HighResMesh.size").unwrap();
+        let high_size_spec = composed
+            .specs
+            .get(&high_size_path)
+            .expect("HighResMesh size attribute should exist");
+        let high_size_value = high_size_spec.fields.get("default").expect("default field");
+        match high_size_value {
+            Value::Double(v) => {
+                assert!((v - 100.0).abs() < 0.001, "High size should be 100.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", high_size_value),
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_variant_composition() {
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("variant_compose.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    variants = {
+        string lodVariant = "high"
+    }
+)
+{
+    # Local opinion that should win over variant
+    double localValue = 999.0
+
+    variantSet "lodVariant" = {
+        "high" {
+            double detail = 100.0
+            double localValue = 1.0
+            def Mesh "VariantMesh"
+            {
+                double meshSize = 50.0
+            }
+        }
+        "low" {
+            double detail = 10.0
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that the Model prim has the "detail" attribute from the selected variant
+        let detail_path = sdf::path("/Model.detail").unwrap();
+        let detail_spec = composed.specs.get(&detail_path).expect("detail attribute should exist on Model");
+        let detail_value = detail_spec.fields.get("default").expect("default field");
+        match detail_value {
+            Value::Double(v) => {
+                assert!((v - 100.0).abs() < 0.001, "detail should be 100.0 from high variant, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", detail_value),
+        }
+
+        // Check that local opinion wins over variant
+        let local_path = sdf::path("/Model.localValue").unwrap();
+        let local_spec = composed.specs.get(&local_path).expect("localValue attribute should exist");
+        let local_value = local_spec.fields.get("default").expect("default field");
+        match local_value {
+            Value::Double(v) => {
+                assert!(
+                    (v - 999.0).abs() < 0.001,
+                    "localValue should be 999.0 (local wins over variant), got {}",
+                    v
+                );
+            }
+            _ => panic!("Expected Double, got {:?}", local_value),
+        }
+
+        // Check that child prim from variant appears under Model
+        let mesh_path = sdf::path("/Model/VariantMesh").unwrap();
+        assert!(
+            composed.specs.contains_key(&mesh_path),
+            "VariantMesh should be composed under Model"
+        );
+
+        // Check attribute on composed child prim
+        let mesh_size_path = sdf::path("/Model/VariantMesh.meshSize").unwrap();
+        let mesh_size_spec = composed.specs.get(&mesh_size_path).expect("meshSize attribute should exist");
+        let mesh_size_value = mesh_size_spec.fields.get("default").expect("default field");
+        match mesh_size_value {
+            Value::Double(v) => {
+                assert!((v - 50.0).abs() < 0.001, "meshSize should be 50.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", mesh_size_value),
+        }
 
         cleanup_temp_dir(&temp_dir);
     }
