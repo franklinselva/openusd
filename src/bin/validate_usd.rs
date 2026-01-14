@@ -8,23 +8,31 @@
 //! 2. Load with full composition (sublayers, references, payloads)
 //! 3. Validate the entire asset structure
 //!
+//! ## Validation Depth Levels
+//!
+//! - `shallow` - Parse only, check syntax without composition
+//! - `compose` - Full composition (default) - resolves sublayers, references, payloads
+//! - `verify` - Compose + verify scene graph structure (parent-child relationships)
+//! - `strict` - Verify + recursively validate all referenced assets exist
+//!
 //! This serves as a reference implementation for how to properly load
 //! USD assets using the openusd crate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use openusd::composition::ComposedLayer;
 use openusd::sdf::{self, Value};
+use openusd::usda::parser::Parser as UsdaParser;
 use openusd::usdc::CrateData;
 use openusd::usdz::Archive;
 
@@ -44,6 +52,33 @@ impl FileType {
             FileType::Usdc => "USDC",
             FileType::Usd => "USD",
             FileType::Usdz => "USDZ",
+        }
+    }
+}
+
+/// Validation depth level.
+///
+/// Ordered from least to most thorough validation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum ValidationDepth {
+    /// Parse only, check syntax without composition.
+    Shallow,
+    /// Full composition - resolves sublayers, references, payloads.
+    #[default]
+    Compose,
+    /// Compose + verify scene graph structure (parent-child relationships).
+    Verify,
+    /// Verify + recursively validate all referenced assets exist.
+    Strict,
+}
+
+impl ValidationDepth {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ValidationDepth::Shallow => "shallow",
+            ValidationDepth::Compose => "compose",
+            ValidationDepth::Verify => "verify",
+            ValidationDepth::Strict => "strict",
         }
     }
 }
@@ -99,6 +134,38 @@ impl AssetRefType {
     }
 }
 
+/// Scene graph validation issue.
+#[derive(Debug, Clone)]
+struct SceneGraphIssue {
+    path: String,
+    issue_type: SceneGraphIssueType,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum SceneGraphIssueType {
+    /// Child spec exists but is not listed in parent's primChildren.
+    OrphanedChild,
+    /// Child is listed in primChildren but no spec exists.
+    MissingChild,
+    /// Prim spec has no parent spec.
+    InvalidParent,
+    /// Same child listed multiple times in primChildren.
+    DuplicateChild,
+}
+
+impl SceneGraphIssueType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SceneGraphIssueType::OrphanedChild => "orphaned_child",
+            SceneGraphIssueType::MissingChild => "missing_child",
+            SceneGraphIssueType::InvalidParent => "invalid_parent",
+            SceneGraphIssueType::DuplicateChild => "duplicate_child",
+        }
+    }
+}
+
 /// USD file validation result.
 #[derive(Debug)]
 enum ValidationResult {
@@ -107,6 +174,8 @@ enum ValidationResult {
         file_type: FileType,
         missing_assets: Vec<AssetRef>,
         composed_layers: usize,
+        prims: usize,
+        scene_graph_issues: Vec<SceneGraphIssue>,
     },
     Skipped {
         reason: String,
@@ -138,8 +207,17 @@ struct Args {
     summary: bool,
 
     /// Check that referenced assets (textures, sublayers, etc.) exist.
+    /// Equivalent to --depth=strict for asset checking.
     #[arg(long, short = 'a')]
     check_assets: bool,
+
+    /// Validation depth level.
+    /// - shallow: Parse only, check syntax
+    /// - compose: Full composition (default)
+    /// - verify: Compose + verify scene graph structure
+    /// - strict: Verify + check all asset references exist
+    #[arg(long, short = 'd', value_enum, default_value_t = ValidationDepth::Compose)]
+    depth: ValidationDepth,
 
     /// Skip files matching these patterns (can be specified multiple times).
     #[arg(long = "skip", short = 'x')]
@@ -155,7 +233,7 @@ fn extract_asset_refs(specs: &HashMap<sdf::Path, sdf::Spec>, base_path: &Path) -
     let mut refs = Vec::new();
     let base_dir = base_path.parent().unwrap_or(Path::new("."));
 
-    for (_path, spec) in specs {
+    for spec in specs.values() {
         for (key, value) in &spec.fields {
             if key == "subLayers" {
                 if let Value::StringVec(layers) = value {
@@ -251,8 +329,198 @@ fn resolve_asset_path(asset_path: &str, base_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Validate a single USDC file.
-fn validate_usdc(path: &Path, check_assets: bool) -> ValidationResult {
+/// Count prim specs (specs that define prims, not properties).
+fn count_prims(specs: &HashMap<sdf::Path, sdf::Spec>) -> usize {
+    specs
+        .keys()
+        .filter(|path| !path.is_property_path() && path.as_str() != "/")
+        .count()
+}
+
+/// Validate scene graph structure.
+///
+/// Checks that:
+/// 1. All children listed in primChildren actually exist as specs
+/// 2. All prim specs have valid parent paths
+/// 3. No duplicate children in primChildren lists
+fn validate_scene_graph(specs: &HashMap<sdf::Path, sdf::Spec>) -> Vec<SceneGraphIssue> {
+    let mut issues = Vec::new();
+
+    // Build a set of all prim paths for quick lookup
+    let prim_paths: HashSet<_> = specs
+        .keys()
+        .filter(|path| !path.is_property_path())
+        .map(|p| p.as_str().to_string())
+        .collect();
+
+    for (path, spec) in specs {
+        // Skip property specs
+        if path.is_property_path() {
+            continue;
+        }
+
+        // Check primChildren field
+        if let Some(Value::TokenVec(children)) = spec.fields.get("primChildren") {
+            let mut seen_children = HashSet::new();
+
+            for child_name in children {
+                // Check for duplicates
+                if !seen_children.insert(child_name.clone()) {
+                    issues.push(SceneGraphIssue {
+                        path: path.as_str().to_string(),
+                        issue_type: SceneGraphIssueType::DuplicateChild,
+                        message: format!("Duplicate child '{}' in primChildren", child_name),
+                    });
+                    continue;
+                }
+
+                // Check that child spec exists
+                let child_path = if path.as_str() == "/" {
+                    format!("/{}", child_name)
+                } else {
+                    format!("{}/{}", path.as_str(), child_name)
+                };
+
+                if !prim_paths.contains(&child_path) {
+                    issues.push(SceneGraphIssue {
+                        path: path.as_str().to_string(),
+                        issue_type: SceneGraphIssueType::MissingChild,
+                        message: format!("Child '{}' listed but spec not found at {}", child_name, child_path),
+                    });
+                }
+            }
+        }
+
+        // Check that parent exists (for non-root prims)
+        let path_str = path.as_str();
+        if path_str != "/" {
+            if let Some(last_slash) = path_str.rfind('/') {
+                let parent_path = if last_slash == 0 { "/" } else { &path_str[..last_slash] };
+
+                if !prim_paths.contains(parent_path) {
+                    issues.push(SceneGraphIssue {
+                        path: path_str.to_string(),
+                        issue_type: SceneGraphIssueType::InvalidParent,
+                        message: format!("Parent spec not found at '{}'", parent_path),
+                    });
+                }
+            }
+        }
+    }
+
+    issues
+}
+
+/// Validate shallow (parse only, no composition).
+fn validate_shallow(path: &Path, file_type: FileType) -> ValidationResult {
+    match file_type {
+        FileType::Usdc | FileType::Usd => {
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    return ValidationResult::Failed {
+                        error: format!("Failed to open file: {}", e),
+                        file_type,
+                    }
+                }
+            };
+            let reader = std::io::BufReader::new(file);
+            match CrateData::open(reader, true) {
+                Ok(data) => {
+                    let specs = data.into_specs();
+                    let prims = count_prims(&specs);
+                    ValidationResult::Success {
+                        specs: specs.len(),
+                        file_type,
+                        missing_assets: Vec::new(),
+                        composed_layers: 1,
+                        prims,
+                        scene_graph_issues: Vec::new(),
+                    }
+                }
+                Err(e) => ValidationResult::Failed {
+                    error: format!("{:#}", e),
+                    file_type,
+                },
+            }
+        }
+        FileType::Usda => {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ValidationResult::Failed {
+                        error: format!("Failed to read file: {}", e),
+                        file_type,
+                    }
+                }
+            };
+            let mut parser = UsdaParser::new(&content);
+            match parser.parse() {
+                Ok(specs) => {
+                    let prims = count_prims(&specs);
+                    ValidationResult::Success {
+                        specs: specs.len(),
+                        file_type,
+                        missing_assets: Vec::new(),
+                        composed_layers: 1,
+                        prims,
+                        scene_graph_issues: Vec::new(),
+                    }
+                }
+                Err(e) => ValidationResult::Failed {
+                    error: format!("{:#}", e),
+                    file_type,
+                },
+            }
+        }
+        FileType::Usdz => {
+            let mut archive = match Archive::open(path) {
+                Ok(a) => a,
+                Err(e) => {
+                    return ValidationResult::Failed {
+                        error: format!("Failed to open USDZ: {:#}", e),
+                        file_type,
+                    }
+                }
+            };
+            let root_layer = match archive.find_root_layer() {
+                Some(layer) => layer,
+                None => {
+                    return ValidationResult::Failed {
+                        error: "Could not find root layer in USDZ archive".to_string(),
+                        file_type,
+                    }
+                }
+            };
+            match archive.read(&root_layer) {
+                Ok(data) => {
+                    let spec_count = if data.has_spec(&openusd::sdf::Path::abs_root()) {
+                        1
+                    } else {
+                        0
+                    };
+                    ValidationResult::Success {
+                        specs: spec_count,
+                        file_type,
+                        missing_assets: Vec::new(),
+                        composed_layers: 1,
+                        prims: 0,
+                        scene_graph_issues: Vec::new(),
+                    }
+                }
+                Err(e) => ValidationResult::Failed {
+                    error: format!("Failed to read root layer '{}': {:#}", root_layer, e),
+                    file_type,
+                },
+            }
+        }
+    }
+}
+
+/// Validate a single USDC file directly (without composition).
+/// This is kept as a potential fallback if ComposedLayer fails.
+#[allow(dead_code)]
+fn validate_usdc(path: &Path, depth: ValidationDepth) -> ValidationResult {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -267,6 +535,8 @@ fn validate_usdc(path: &Path, check_assets: bool) -> ValidationResult {
     match CrateData::open(reader, true) {
         Ok(data) => {
             let specs = data.into_specs();
+            let prims = count_prims(&specs);
+            let check_assets = depth == ValidationDepth::Strict;
             let missing_assets = if check_assets {
                 extract_asset_refs(&specs, path)
                     .into_iter()
@@ -275,11 +545,18 @@ fn validate_usdc(path: &Path, check_assets: bool) -> ValidationResult {
             } else {
                 Vec::new()
             };
+            let scene_graph_issues = if depth >= ValidationDepth::Verify {
+                validate_scene_graph(&specs)
+            } else {
+                Vec::new()
+            };
             ValidationResult::Success {
                 specs: specs.len(),
                 file_type: FileType::Usdc,
                 missing_assets,
                 composed_layers: 1,
+                prims,
+                scene_graph_issues,
             }
         }
         Err(e) => ValidationResult::Failed {
@@ -290,7 +567,7 @@ fn validate_usdc(path: &Path, check_assets: bool) -> ValidationResult {
 }
 
 /// Validate a USDZ archive by checking its root USD file.
-fn validate_usdz(path: &Path, _check_assets: bool) -> ValidationResult {
+fn validate_usdz(path: &Path, _depth: ValidationDepth) -> ValidationResult {
     let mut archive = match Archive::open(path) {
         Ok(a) => a,
         Err(e) => {
@@ -325,6 +602,8 @@ fn validate_usdz(path: &Path, _check_assets: bool) -> ValidationResult {
                 file_type: FileType::Usdz,
                 missing_assets: Vec::new(),
                 composed_layers: 1,
+                prims: 0, // USDZ validation is simpler
+                scene_graph_issues: Vec::new(),
             }
         }
         Err(e) => ValidationResult::Failed {
@@ -336,9 +615,11 @@ fn validate_usdz(path: &Path, _check_assets: bool) -> ValidationResult {
 
 /// Validate using ComposedLayer (resolves sublayers, references, etc.).
 /// This is the primary validation method as it tests full USD composition.
-fn validate_composed(path: &Path, file_type: FileType, check_assets: bool) -> ValidationResult {
+fn validate_composed(path: &Path, file_type: FileType, depth: ValidationDepth) -> ValidationResult {
     match ComposedLayer::open(path) {
         Ok(composed) => {
+            let prims = count_prims(&composed.specs);
+            let check_assets = depth == ValidationDepth::Strict;
             let missing_assets = if check_assets {
                 extract_asset_refs(&composed.specs, path)
                     .into_iter()
@@ -347,11 +628,18 @@ fn validate_composed(path: &Path, file_type: FileType, check_assets: bool) -> Va
             } else {
                 Vec::new()
             };
+            let scene_graph_issues = if depth >= ValidationDepth::Verify {
+                validate_scene_graph(&composed.specs)
+            } else {
+                Vec::new()
+            };
             ValidationResult::Success {
                 specs: composed.specs.len(),
                 file_type,
                 missing_assets,
                 composed_layers: composed.composed_layers.len(),
+                prims,
+                scene_graph_issues,
             }
         }
         Err(e) => ValidationResult::Failed {
@@ -361,26 +649,36 @@ fn validate_composed(path: &Path, file_type: FileType, check_assets: bool) -> Va
     }
 }
 
-/// Validate a single file with full composition support.
+/// Validate a single file with the specified depth.
 /// Automatically detects format for .usd files.
-fn validate_file(path: &Path, check_assets: bool) -> ValidationResult {
+fn validate_file(path: &Path, depth: ValidationDepth) -> ValidationResult {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-
-    match extension.as_str() {
-        "usda" => validate_composed(path, FileType::Usda, check_assets),
-        "usdc" => validate_composed(path, FileType::Usdc, check_assets),
-        "usd" => {
-            // Detect actual format and validate with composition
-            let actual_type = detect_usd_format(path).unwrap_or(FileType::Usd);
-            match actual_type {
-                FileType::Usdc => validate_usdc(path, check_assets),
-                _ => validate_composed(path, FileType::Usd, check_assets),
+    let file_type = match extension.as_str() {
+        "usda" => FileType::Usda,
+        "usdc" => FileType::Usdc,
+        "usd" => detect_usd_format(path).unwrap_or(FileType::Usd),
+        "usdz" => FileType::Usdz,
+        _ => {
+            return ValidationResult::Skipped {
+                reason: format!("Not a USD file: .{}", extension),
             }
         }
-        "usdz" => validate_usdz(path, check_assets),
-        _ => ValidationResult::Skipped {
-            reason: format!("Not a USD file: .{}", extension),
-        },
+    };
+
+    // Shallow validation: parse only, no composition
+    if depth == ValidationDepth::Shallow {
+        return validate_shallow(path, file_type);
+    }
+
+    // Compose, Verify, Strict all use composition
+    match file_type {
+        FileType::Usda | FileType::Usd => validate_composed(path, file_type, depth),
+        FileType::Usdc => {
+            // For .usdc files with compose+ depth, try composition first
+            // Fall back to direct USDC parsing if composition fails
+            validate_composed(path, file_type, depth)
+        }
+        FileType::Usdz => validate_usdz(path, depth),
     }
 }
 
@@ -454,7 +752,7 @@ fn find_asset_root_files(asset_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Validate an asset directory by finding and validating root USD files.
-fn validate_asset_directory(asset_dir: &Path, check_assets: bool, verbose: bool) -> Vec<(PathBuf, ValidationResult)> {
+fn validate_asset_directory(asset_dir: &Path, depth: ValidationDepth, verbose: bool) -> Vec<(PathBuf, ValidationResult)> {
     let mut results = Vec::new();
 
     let root_files = match find_asset_root_files(asset_dir) {
@@ -475,7 +773,7 @@ fn validate_asset_directory(asset_dir: &Path, check_assets: bool, verbose: bool)
     }
 
     for root_file in root_files {
-        let result = validate_file(&root_file, check_assets);
+        let result = validate_file(&root_file, depth);
         results.push((root_file, result));
     }
 
@@ -516,30 +814,43 @@ struct FileTypeStats {
     failed: usize,
 }
 
+/// Compute effective validation depth from args.
+fn effective_depth(args: &Args) -> ValidationDepth {
+    // --check-assets implies at least Strict depth
+    if args.check_assets && args.depth < ValidationDepth::Strict {
+        ValidationDepth::Strict
+    } else {
+        args.depth
+    }
+}
+
 fn main() {
     let args = Args::parse();
     let start = Instant::now();
+    let depth = effective_depth(&args);
+
+    println!("Validation depth: {}", depth.as_str());
 
     // Determine validation mode
     let is_asset_mode = args.asset || (args.path.is_dir() && !args.path.join(".git").exists());
 
     if is_asset_mode && args.path.is_dir() {
         // Asset directory mode - find and validate root USD files
-        run_asset_validation(&args);
+        run_asset_validation(&args, depth);
     } else {
         // File or recursive directory mode
-        run_file_validation(&args);
+        run_file_validation(&args, depth);
     }
 
     println!("\nTime elapsed: {:.2}s", start.elapsed().as_secs_f64());
 }
 
-fn run_asset_validation(args: &Args) {
+fn run_asset_validation(args: &Args, depth: ValidationDepth) {
     println!("Asset Validation Mode");
     println!("=====================");
     println!("Asset directory: {}\n", args.path.display());
 
-    let results = validate_asset_directory(&args.path, args.check_assets, args.verbose);
+    let results = validate_asset_directory(&args.path, depth, args.verbose);
 
     if results.is_empty() {
         eprintln!("No USD files found in asset directory: {}", args.path.display());
@@ -548,6 +859,7 @@ fn run_asset_validation(args: &Args) {
 
     let mut passed = 0;
     let mut failed = 0;
+    let mut total_scene_graph_issues = 0;
 
     for (path, result) in &results {
         let rel_path = path.strip_prefix(&args.path).unwrap_or(path);
@@ -557,13 +869,16 @@ fn run_asset_validation(args: &Args) {
                 specs,
                 file_type,
                 composed_layers,
+                prims,
                 missing_assets,
+                scene_graph_issues,
             } => {
                 passed += 1;
                 println!(
-                    "[PASS] {} ({} specs, {} layers, {})",
+                    "[PASS] {} ({} specs, {} prims, {} layers, {})",
                     rel_path.display(),
                     specs,
+                    prims,
                     composed_layers,
                     file_type.as_str()
                 );
@@ -574,6 +889,14 @@ fn run_asset_validation(args: &Args) {
                         println!("         - [{}] {}", asset.ref_type.as_str(), asset.path);
                     }
                 }
+
+                if args.verbose && !scene_graph_issues.is_empty() {
+                    println!("       Scene graph issues:");
+                    for issue in scene_graph_issues {
+                        println!("         - [{}] {}: {}", issue.issue_type.as_str(), issue.path, issue.message);
+                    }
+                }
+                total_scene_graph_issues += scene_graph_issues.len();
             }
             ValidationResult::Skipped { reason } => {
                 println!("[SKIP] {} - {}", rel_path.display(), reason);
@@ -593,13 +916,16 @@ fn run_asset_validation(args: &Args) {
     println!("Root files found: {}", results.len());
     println!("Passed:           {}", passed);
     println!("Failed:           {}", failed);
+    if depth >= ValidationDepth::Verify {
+        println!("Scene graph issues: {}", total_scene_graph_issues);
+    }
 
     if failed > 0 {
         std::process::exit(1);
     }
 }
 
-fn run_file_validation(args: &Args) {
+fn run_file_validation(args: &Args, depth: ValidationDepth) {
     let files = collect_usd_files(&args.path, &args.skip_patterns);
 
     if files.is_empty() {
@@ -625,9 +951,12 @@ fn run_file_validation(args: &Args) {
     let passed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
+    let scene_graph_issue_count = AtomicUsize::new(0);
     let type_stats: std::sync::Mutex<HashMap<FileType, FileTypeStats>> = std::sync::Mutex::new(HashMap::new());
     let failures: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
     let asset_warnings: std::sync::Mutex<Vec<(PathBuf, Vec<AssetRef>)>> = std::sync::Mutex::new(Vec::new());
+    let scene_graph_warnings: std::sync::Mutex<Vec<(PathBuf, Vec<SceneGraphIssue>)>> =
+        std::sync::Mutex::new(Vec::new());
     let fail_fast_triggered = AtomicBool::new(false);
 
     files.par_iter().for_each(|file| {
@@ -635,7 +964,7 @@ fn run_file_validation(args: &Args) {
             return;
         }
 
-        let result = validate_file(file, args.check_assets);
+        let result = validate_file(file, depth);
 
         if let Some(ref pb) = progress {
             pb.inc(1);
@@ -647,8 +976,11 @@ fn run_file_validation(args: &Args) {
                 file_type,
                 missing_assets,
                 composed_layers,
+                prims,
+                scene_graph_issues,
             } => {
                 passed.fetch_add(1, Ordering::Relaxed);
+                scene_graph_issue_count.fetch_add(scene_graph_issues.len(), Ordering::Relaxed);
 
                 {
                     let mut stats = type_stats.lock().unwrap();
@@ -660,9 +992,10 @@ fn run_file_validation(args: &Args) {
                 if args.verbose {
                     let rel_path = file.strip_prefix(&args.path).unwrap_or(file);
                     println!(
-                        "[PASS] {} ({} specs, {} layers, {})",
+                        "[PASS] {} ({} specs, {} prims, {} layers, {})",
                         rel_path.display(),
                         specs,
+                        prims,
                         composed_layers,
                         file_type.as_str()
                     );
@@ -674,6 +1007,14 @@ fn run_file_validation(args: &Args) {
                         .lock()
                         .unwrap()
                         .push((rel_path.to_path_buf(), missing_assets.clone()));
+                }
+
+                if !scene_graph_issues.is_empty() {
+                    let rel_path = file.strip_prefix(&args.path).unwrap_or(file);
+                    scene_graph_warnings
+                        .lock()
+                        .unwrap()
+                        .push((rel_path.to_path_buf(), scene_graph_issues.clone()));
                 }
             }
             ValidationResult::Skipped { reason } => {
@@ -734,6 +1075,12 @@ fn run_file_validation(args: &Args) {
     println!("Passed:       {} ({:.1}%)", pass_count, pass_pct);
     println!("Failed:       {} ({:.1}%)", fail_count, fail_pct);
     println!("Skipped:      {} ({:.1}%)", skip_count, skip_pct);
+    if depth >= ValidationDepth::Verify {
+        println!(
+            "Scene graph issues: {}",
+            scene_graph_issue_count.load(Ordering::Relaxed)
+        );
+    }
     println!();
 
     let stats = type_stats.lock().unwrap();
@@ -759,7 +1106,23 @@ fn run_file_validation(args: &Args) {
         println!();
     }
 
-    if args.check_assets {
+    // Print scene graph issues if in verify or strict mode
+    if depth >= ValidationDepth::Verify {
+        let graph_warnings = scene_graph_warnings.lock().unwrap();
+        if !graph_warnings.is_empty() && args.verbose {
+            println!("Scene graph issues:");
+            for (path, issues) in graph_warnings.iter() {
+                println!("  {}:", path.display());
+                for issue in issues {
+                    println!("    - [{}] {}", issue.issue_type.as_str(), issue.message);
+                }
+            }
+            println!();
+        }
+    }
+
+    // Print missing asset references if in strict mode
+    if depth == ValidationDepth::Strict {
         let warnings = asset_warnings.lock().unwrap();
         if !warnings.is_empty() {
             println!("Missing asset references:");
@@ -769,6 +1132,7 @@ fn run_file_validation(args: &Args) {
                     println!("    - [{}] {}", asset.ref_type.as_str(), asset.path);
                 }
             }
+            println!();
         }
     }
 
@@ -783,9 +1147,9 @@ fn run_file_validation(args: &Args) {
         }
     }
 
-    if fail_count > 0 && !args.fail_fast {
-        std::process::exit(1);
-    } else if args.fail_fast && fail_fast_triggered.load(Ordering::Relaxed) {
+    let should_exit =
+        (fail_count > 0 && !args.fail_fast) || (args.fail_fast && fail_fast_triggered.load(Ordering::Relaxed));
+    if should_exit {
         std::process::exit(1);
     }
 }

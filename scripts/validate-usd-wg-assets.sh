@@ -9,8 +9,15 @@
 #
 # Options:
 #   -v, --verbose     Show detailed output for each file
-#   -a, --assets      Check that referenced assets exist
+#   -a, --assets      Check that referenced assets exist (implies --depth=strict)
 #   -f, --fail-fast   Stop on first error
+#   -d, --depth LEVEL Validation depth: shallow, compose (default), verify, strict
+#
+# Validation Depth Levels:
+#   shallow  - Parse only, check syntax without composition
+#   compose  - Full composition (default) - resolves sublayers, references, payloads
+#   verify   - Compose + verify scene graph structure (parent-child relationships)
+#   strict   - Verify + check all asset references exist
 
 set -e
 
@@ -45,13 +52,21 @@ echo ""
 echo "USD Working Group Assets Validation"
 echo "===================================="
 echo "Assets directory: $ASSETS_DIR"
-echo ""
 
 # Parse arguments - pass through to validator
 VALIDATOR_ARGS=""
+DEPTH="compose"
 for arg in "$@"; do
+    case "$arg" in
+        --depth=*)
+            DEPTH="${arg#*=}"
+            ;;
+    esac
     VALIDATOR_ARGS="$VALIDATOR_ARGS $arg"
 done
+
+echo "Validation depth: $DEPTH"
+echo ""
 
 # Check if an asset should be skipped
 should_skip() {
