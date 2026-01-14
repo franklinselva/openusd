@@ -2411,4 +2411,105 @@ def Xform "root" {
             "/root/Physics/PhysicsMaterial"
         );
     }
+
+    #[test]
+    // Verifies the full connection.usda fixture parses correctly, testing asset types, connections, and all shader nodes.
+    fn parse_connection_fixture() {
+        let data = fs::read_to_string("fixtures/connection.usda").expect("read connection fixture");
+        let mut parser = Parser::new(&data);
+        let specs = parser.parse().expect("connection.usda should parse");
+
+        // Verify the boardMat Material prim exists
+        let board_mat_path = sdf::path("/boardMat").unwrap();
+        assert!(
+            specs.contains_key(&board_mat_path),
+            "Should have /boardMat Material prim"
+        );
+
+        // Verify frame:stPrimvarName attribute
+        let primvar_attr = specs
+            .get(&sdf::path("/boardMat.inputs:frame:stPrimvarName").unwrap())
+            .expect("inputs:frame:stPrimvarName attribute");
+        assert!(matches!(
+            primvar_attr.fields.get(FieldKey::Default.as_str()),
+            Some(sdf::Value::Token(v)) | Some(sdf::Value::String(v)) if v == "st"
+        ));
+
+        // Verify outputs:surface.connect on Material has connection path
+        let surface_conn = specs
+            .get(&sdf::path("/boardMat.outputs:surface.connect").unwrap())
+            .expect("outputs:surface.connect attribute");
+        let conn_paths = surface_conn
+            .fields
+            .get(FieldKey::ConnectionPaths.as_str())
+            .and_then(|v| v.try_as_path_list_op_ref())
+            .expect("connection paths");
+        assert_eq!(conn_paths.explicit_items.len(), 1);
+        assert_eq!(
+            conn_paths.explicit_items[0].as_str(),
+            "/TexModel/boardMat/PBRShader.outputs:surface"
+        );
+
+        // Verify PBRShader exists
+        let pbr_shader = specs
+            .get(&sdf::path("/boardMat/PBRShader").unwrap())
+            .expect("PBRShader prim");
+        assert!(pbr_shader.fields.contains_key(FieldKey::TypeName.as_str()));
+
+        // Verify diffuseColor.connect attribute on PBRShader
+        let diffuse_conn = specs
+            .get(&sdf::path("/boardMat/PBRShader.inputs:diffuseColor.connect").unwrap())
+            .expect("inputs:diffuseColor.connect attribute");
+        let diffuse_paths = diffuse_conn
+            .fields
+            .get(FieldKey::ConnectionPaths.as_str())
+            .and_then(|v| v.try_as_path_list_op_ref())
+            .expect("diffuseColor connection paths");
+        assert_eq!(diffuse_paths.explicit_items.len(), 1);
+        assert_eq!(
+            diffuse_paths.explicit_items[0].as_str(),
+            "/TexModel/boardMat/diffuseTexture.outputs:rgb"
+        );
+
+        // Verify stReader exists and has varname.connect
+        let varname_conn = specs
+            .get(&sdf::path("/boardMat/stReader.inputs:varname.connect").unwrap())
+            .expect("inputs:varname.connect attribute");
+        let varname_paths = varname_conn
+            .fields
+            .get(FieldKey::ConnectionPaths.as_str())
+            .and_then(|v| v.try_as_path_list_op_ref())
+            .expect("varname connection paths");
+        assert_eq!(varname_paths.explicit_items.len(), 1);
+        assert_eq!(
+            varname_paths.explicit_items[0].as_str(),
+            "/TexModel/boardMat.inputs:frame:stPrimvarName"
+        );
+
+        // Verify diffuseTexture shader exists with asset file path
+        let file_attr = specs
+            .get(&sdf::path("/boardMat/diffuseTexture.inputs:file").unwrap())
+            .expect("inputs:file attribute");
+        assert!(matches!(
+            file_attr.fields.get(FieldKey::Default.as_str()),
+            Some(sdf::Value::AssetPath(path)) if path == "USDLogoLrg.png"
+        ));
+
+        // Verify st.connect attribute on diffuseTexture
+        let st_conn = specs
+            .get(&sdf::path("/boardMat/diffuseTexture.inputs:st.connect").unwrap())
+            .expect("inputs:st.connect attribute");
+        let st_paths = st_conn
+            .fields
+            .get(FieldKey::ConnectionPaths.as_str())
+            .and_then(|v| v.try_as_path_list_op_ref())
+            .expect("st connection paths");
+        assert_eq!(st_paths.explicit_items.len(), 1);
+        assert_eq!(
+            st_paths.explicit_items[0].as_str(),
+            "/TexModel/boardMat/stReader.outputs:result"
+        );
+
+        println!("Successfully parsed connection.usda fixture with {} specs", specs.len());
+    }
 }

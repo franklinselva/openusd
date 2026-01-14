@@ -72,6 +72,35 @@ where
 
         Ok(Self { file, data })
     }
+
+    /// Consume the reader and return all specs with values resolved.
+    ///
+    /// This eagerly resolves all lazy `ValueRep` references to actual `sdf::Value`s.
+    /// Use this when you need to extract all specs for composition.
+    pub fn into_specs(mut self) -> HashMap<sdf::Path, sdf::Spec> {
+        let mut result = HashMap::new();
+
+        for (path, spec) in self.data {
+            let mut resolved_fields = HashMap::new();
+
+            for (field_name, value_rep) in spec.fields {
+                if let Ok(value) = self.file.value(value_rep) {
+                    resolved_fields.insert(field_name, value);
+                }
+                // Skip fields that fail to resolve
+            }
+
+            result.insert(
+                path,
+                sdf::Spec {
+                    ty: spec.ty,
+                    fields: resolved_fields,
+                },
+            );
+        }
+
+        result
+    }
 }
 
 impl<R> sdf::AbstractData for CrateData<R>

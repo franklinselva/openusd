@@ -34,6 +34,16 @@ impl TextReader {
     pub fn from_data(data: HashMap<sdf::Path, sdf::Spec>) -> Self {
         Self { data }
     }
+
+    /// Consume the reader and return the underlying specs.
+    pub fn into_specs(self) -> HashMap<sdf::Path, sdf::Spec> {
+        self.data
+    }
+
+    /// Get a reference to the underlying specs.
+    pub fn specs(&self) -> &HashMap<sdf::Path, sdf::Spec> {
+        &self.data
+    }
 }
 
 impl sdf::AbstractData for TextReader {
