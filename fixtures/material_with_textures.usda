@@ -1,0 +1,120 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1.0
+    upAxis = "Y"
+)
+
+def Xform "Root"
+{
+    def Xform "Materials"
+    {
+        def Material "TexturedMaterial"
+        {
+            token outputs:surface.connect = </Root/Materials/TexturedMaterial/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </Root/Materials/TexturedMaterial/DiffuseTexture.outputs:rgb>
+                float inputs:metallic.connect = </Root/Materials/TexturedMaterial/MetallicTexture.outputs:r>
+                float inputs:roughness.connect = </Root/Materials/TexturedMaterial/RoughnessTexture.outputs:r>
+                normal3f inputs:normal.connect = </Root/Materials/TexturedMaterial/NormalTexture.outputs:rgb>
+                float inputs:opacity = 1.0
+                float inputs:ior = 1.5
+                token outputs:surface
+            }
+
+            def Shader "DiffuseTexture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @textures/diffuse.png@
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
+                float4 inputs:scale = (1, 1, 1, 1)
+                float4 inputs:bias = (0, 0, 0, 0)
+                token inputs:sourceColorSpace = "sRGB"
+                float2 inputs:st.connect = </Root/Materials/TexturedMaterial/UVReader.outputs:result>
+                float3 outputs:rgb
+            }
+
+            def Shader "MetallicTexture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @textures/metallic.png@
+                token inputs:wrapS = "clamp"
+                token inputs:wrapT = "clamp"
+                token inputs:sourceColorSpace = "raw"
+                float2 inputs:st.connect = </Root/Materials/TexturedMaterial/UVReader.outputs:result>
+                float outputs:r
+            }
+
+            def Shader "RoughnessTexture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @textures/roughness.png@
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
+                token inputs:sourceColorSpace = "raw"
+                float2 inputs:st.connect = </Root/Materials/TexturedMaterial/UVReader.outputs:result>
+                float outputs:r
+            }
+
+            def Shader "NormalTexture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @textures/normal.png@
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
+                token inputs:sourceColorSpace = "raw"
+                float2 inputs:st.connect = </Root/Materials/TexturedMaterial/UVReader.outputs:result>
+                float3 outputs:rgb
+            }
+
+            def Shader "UVReader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                token inputs:varname = "st"
+                float2 outputs:result
+            }
+        }
+
+        def Material "SimpleMaterial"
+        {
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.8, 0.2, 0.2)
+                float inputs:metallic = 0.5
+                float inputs:roughness = 0.3
+                color3f inputs:emissiveColor = (0.1, 0.0, 0.0)
+                float inputs:opacity = 0.9
+                float inputs:opacityThreshold = 0.5
+            }
+        }
+
+        def Material "MultiUVMaterial"
+        {
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </Root/Materials/MultiUVMaterial/DiffuseTexture.outputs:rgb>
+            }
+
+            def Shader "DiffuseTexture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @textures/diffuse.png@
+                float2 inputs:st.connect = </Root/Materials/MultiUVMaterial/UVReader1.outputs:result>
+                float3 outputs:rgb
+            }
+
+            def Shader "UVReader1"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                token inputs:varname = "st1"
+                float2 outputs:result
+            }
+        }
+    }
+}
