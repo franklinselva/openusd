@@ -1,15 +1,11 @@
 //! Integration tests for the shade module.
 
 use openusd::composition::ComposedLayer;
-use openusd::shade::{
-    parse_materials, resolve_uv_set, SourceColorSpace, TextureOutput, TextureSlot, WrapMode,
-};
+use openusd::shade::{parse_materials, resolve_uv_set, SourceColorSpace, TextureOutput, TextureSlot, WrapMode};
 use std::path::PathBuf;
 
 fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(name)
 }
 
 #[test]

@@ -23,8 +23,8 @@
 //! }
 //! ```
 
-mod types;
 mod parser;
+mod types;
 
-pub use types::*;
 pub use parser::parse_materials;
+pub use types::*;

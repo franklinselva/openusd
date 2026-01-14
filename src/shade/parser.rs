@@ -53,7 +53,7 @@ fn parse_material(specs: &HashMap<SdfPath, Spec>, material_path: &SdfPath) -> Op
     let spec = specs.get(material_path)?;
 
     let path_str = material_path.to_string();
-    let name = path_str.split('/').last().unwrap_or("").to_string();
+    let name = path_str.split('/').next_back().unwrap_or("").to_string();
 
     let mut material = Material {
         prim_path: path_str.clone(),
@@ -129,9 +129,14 @@ fn parse_shader_child(
                 material.textures.push(texture);
             }
         }
-        "UsdPrimvarReader_float2" | "UsdPrimvarReader_float3" | "UsdPrimvarReader_float"
-        | "UsdPrimvarReader_int" | "UsdPrimvarReader_string" | "UsdPrimvarReader_normal"
-        | "UsdPrimvarReader_point" | "UsdPrimvarReader_vector" => {
+        "UsdPrimvarReader_float2"
+        | "UsdPrimvarReader_float3"
+        | "UsdPrimvarReader_float"
+        | "UsdPrimvarReader_int"
+        | "UsdPrimvarReader_string"
+        | "UsdPrimvarReader_normal"
+        | "UsdPrimvarReader_point"
+        | "UsdPrimvarReader_vector" => {
             if let Some(reader) = parse_primvar_reader(specs, shader_path) {
                 material.primvar_readers.push(reader);
             }
@@ -171,12 +176,10 @@ fn parse_preview_surface(specs: &HashMap<SdfPath, Spec>, shader_path: &SdfPath) 
     };
 
     // Parse scalar attributes
-    surface.diffuse_color =
-        parse_color_or_texture_slot(specs, &path_str, "diffuseColor", [0.18, 0.18, 0.18, 1.0]);
+    surface.diffuse_color = parse_color_or_texture_slot(specs, &path_str, "diffuseColor", [0.18, 0.18, 0.18, 1.0]);
     surface.metallic = parse_scalar_or_texture_slot(specs, &path_str, "metallic", 0.0);
     surface.roughness = parse_scalar_or_texture_slot(specs, &path_str, "roughness", 0.5);
-    surface.emissive_color =
-        parse_color_or_texture_slot(specs, &path_str, "emissiveColor", [0.0, 0.0, 0.0, 1.0]);
+    surface.emissive_color = parse_color_or_texture_slot(specs, &path_str, "emissiveColor", [0.0, 0.0, 0.0, 1.0]);
     surface.opacity = parse_scalar_or_texture_slot(specs, &path_str, "opacity", 1.0);
 
     // Optional texture slots
@@ -268,10 +271,7 @@ fn parse_color_or_texture_slot(
     // Check for texture connection first
     if let Some(connection) = get_connection(specs, shader_path, attr_name) {
         let (texture_path, output) = parse_connection_path(&connection);
-        return TextureSlot::Texture(TextureRef {
-            texture_path,
-            output,
-        });
+        return TextureSlot::Texture(TextureRef { texture_path, output });
     }
 
     // Fall back to scalar value
@@ -292,10 +292,7 @@ fn parse_scalar_or_texture_slot(
     // Check for texture connection first
     if let Some(connection) = get_connection(specs, shader_path, attr_name) {
         let (texture_path, output) = parse_connection_path(&connection);
-        return TextureSlot::Texture(TextureRef {
-            texture_path,
-            output,
-        });
+        return TextureSlot::Texture(TextureRef { texture_path, output });
     }
 
     // Fall back to scalar value
@@ -303,13 +300,14 @@ fn parse_scalar_or_texture_slot(
 }
 
 /// Parse an optional texture-only slot (like normal map).
-fn parse_optional_texture_slot(specs: &HashMap<SdfPath, Spec>, shader_path: &str, attr_name: &str) -> Option<TextureSlot> {
+fn parse_optional_texture_slot(
+    specs: &HashMap<SdfPath, Spec>,
+    shader_path: &str,
+    attr_name: &str,
+) -> Option<TextureSlot> {
     if let Some(connection) = get_connection(specs, shader_path, attr_name) {
         let (texture_path, output) = parse_connection_path(&connection);
-        Some(TextureSlot::Texture(TextureRef {
-            texture_path,
-            output,
-        }))
+        Some(TextureSlot::Texture(TextureRef { texture_path, output }))
     } else {
         None
     }

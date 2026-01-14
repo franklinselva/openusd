@@ -25,7 +25,7 @@ impl WrapMode {
             "clamp" => WrapMode::Clamp,
             "mirror" => WrapMode::Mirror,
             "black" => WrapMode::Black,
-            "repeat" | _ => WrapMode::Repeat,
+            _ => WrapMode::Repeat,
         }
     }
 }
@@ -50,7 +50,7 @@ impl SourceColorSpace {
         match token.to_lowercase().as_str() {
             "raw" | "linear" => SourceColorSpace::Raw,
             "srgb" => SourceColorSpace::SRGB,
-            "auto" | _ => SourceColorSpace::Auto,
+            _ => SourceColorSpace::Auto,
         }
     }
 }
@@ -81,7 +81,7 @@ impl TextureOutput {
             "g" => TextureOutput::G,
             "b" => TextureOutput::B,
             "a" => TextureOutput::A,
-            "rgb" | _ => TextureOutput::RGB,
+            _ => TextureOutput::RGB,
         }
     }
 }
@@ -328,7 +328,7 @@ impl Default for UsdPreviewSurface {
 /// A complete parsed USD Material.
 ///
 /// Contains the surface shader and all referenced texture/primvar reader nodes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Material {
     /// The prim path of this material (e.g., `/Materials/WoodMaterial`).
     pub prim_path: String,
@@ -348,19 +348,6 @@ pub struct Material {
     /// Raw texture file paths discovered (for convenience).
     /// Maps texture shader path to file path.
     pub texture_files: HashMap<String, String>,
-}
-
-impl Default for Material {
-    fn default() -> Self {
-        Self {
-            prim_path: String::new(),
-            name: String::new(),
-            surface: None,
-            textures: Vec::new(),
-            primvar_readers: Vec::new(),
-            texture_files: HashMap::new(),
-        }
-    }
 }
 
 impl Material {

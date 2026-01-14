@@ -515,10 +515,7 @@ impl<'a> super::Parser<'a> {
     ///     100: (100, 0, 0),
     /// }
     /// ```
-    pub(super) fn parse_time_samples(
-        &mut self,
-        data_type: super::value::types::Type,
-    ) -> Result<sdf::TimeSampleMap> {
+    pub(super) fn parse_time_samples(&mut self, data_type: super::value::types::Type) -> Result<sdf::TimeSampleMap> {
         self.ensure_pun('{').context("Time samples must start with {")?;
 
         let mut samples = Vec::new();
@@ -572,7 +569,8 @@ impl<'a> super::Parser<'a> {
             .ok_or_else(|| anyhow!("Expected variant set name string, got {name_token:?}"))?;
 
         self.ensure_pun('=').context("Expected '=' after variant set name")?;
-        self.ensure_pun('{').context("Expected '{' to start variant set block")?;
+        self.ensure_pun('{')
+            .context("Expected '{' to start variant set block")?;
 
         // Parse each variant within the set
         let mut variant_children = Vec::new();
@@ -644,21 +642,11 @@ impl<'a> super::Parser<'a> {
                         let list_op = self.fetch_next()?;
                         if self.is_next(Token::Rel) {
                             self.fetch_next()?; // consume 'rel'
-                            self.read_relationship_with_list_op(
-                                &variant_path,
-                                &mut variant_properties,
-                                data,
-                                list_op,
-                            )
-                            .context("Unable to read relationship in variant")?;
+                            self.read_relationship_with_list_op(&variant_path, &mut variant_properties, data, list_op)
+                                .context("Unable to read relationship in variant")?;
                         } else {
-                            self.read_attribute_with_list_op(
-                                &variant_path,
-                                &mut variant_properties,
-                                data,
-                                list_op,
-                            )
-                            .context("Unable to read attribute in variant")?;
+                            self.read_attribute_with_list_op(&variant_path, &mut variant_properties, data, list_op)
+                                .context("Unable to read attribute in variant")?;
                         }
                     }
                     _ => {

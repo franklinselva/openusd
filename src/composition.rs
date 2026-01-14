@@ -73,8 +73,15 @@ impl ComposedLayer {
         if sublayer_paths.is_empty() {
             // Apply LIVRPS composition arcs even without sublayers
             let mut specs = specs;
+            // I - Inherits
             Self::compose_inherits(&mut specs);
+            // V - Variants
             Self::compose_variants(&mut specs);
+            // R - References
+            Self::compose_references(&mut specs, base_dir, visited);
+            // P - Payloads
+            Self::compose_payloads(&mut specs, base_dir, visited);
+            // S - Specializes
             Self::compose_specializes(&mut specs);
 
             return Ok(ComposedLayer {
@@ -95,10 +102,7 @@ impl ComposedLayer {
             .iter()
             .enumerate()
             .map(|(i, path)| {
-                let offset = sublayer_offsets
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_default();
+                let offset = sublayer_offsets.get(i).cloned().unwrap_or_default();
                 (path, offset)
             })
             .collect();
@@ -139,6 +143,10 @@ impl ComposedLayer {
         Self::compose_inherits(&mut composed_specs);
         // V - Variants (selected variant content)
         Self::compose_variants(&mut composed_specs);
+        // R - References
+        Self::compose_references(&mut composed_specs, base_dir, visited);
+        // P - Payloads
+        Self::compose_payloads(&mut composed_specs, base_dir, visited);
         // S - Specializes (weakest arc)
         Self::compose_specializes(&mut composed_specs);
 
@@ -149,13 +157,12 @@ impl ComposedLayer {
         })
     }
 
-    /// Parse a layer file based on its extension.
+    /// Parse a layer file based on its extension and content.
     fn parse_layer(path: &Path) -> Result<HashMap<SdfPath, Spec>> {
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
         match extension.as_str() {
-            "usda" | "usd" => {
-                // Try text format first for .usd files
+            "usda" => {
                 let reader =
                     TextReader::read(path).with_context(|| format!("Failed to read USDA: {}", path.display()))?;
                 Ok(reader.into_specs())
@@ -168,26 +175,38 @@ impl ComposedLayer {
                     .with_context(|| format!("Failed to read USDC: {}", path.display()))?;
                 Ok(crate_data.into_specs())
             }
-            _ => {
-                // Try to detect format from file contents
-                let mut file = std::fs::File::open(path)?;
-                let mut header = [0u8; 8];
-                use std::io::Read;
-                file.read_exact(&mut header)?;
-
-                // Check for USDC magic number "PXR-USDC"
-                if &header == b"PXR-USDC" {
-                    drop(file);
-                    let file = std::fs::File::open(path)?;
-                    let reader = std::io::BufReader::new(file);
-                    let crate_data = CrateData::open(reader, false)?;
-                    Ok(crate_data.into_specs())
-                } else {
-                    // Assume text format
-                    let reader = TextReader::read(path)?;
-                    Ok(reader.into_specs())
-                }
+            "usd" => {
+                // For .usd files, detect format from file contents
+                Self::parse_layer_auto_detect(path)
             }
+            _ => {
+                // For unknown extensions, try auto-detection
+                Self::parse_layer_auto_detect(path)
+            }
+        }
+    }
+
+    /// Auto-detect USD format by checking magic bytes and parse accordingly.
+    fn parse_layer_auto_detect(path: &Path) -> Result<HashMap<SdfPath, Spec>> {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)
+            .with_context(|| format!("Failed to read file header: {}", path.display()))?;
+        drop(file);
+
+        // Check for USDC magic number "PXR-USDC"
+        if &header == b"PXR-USDC" {
+            let file = std::fs::File::open(path)?;
+            let reader = std::io::BufReader::new(file);
+            let crate_data =
+                CrateData::open(reader, false).with_context(|| format!("Failed to read USDC: {}", path.display()))?;
+            Ok(crate_data.into_specs())
+        } else {
+            // Assume text format (USDA)
+            let reader = TextReader::read(path).with_context(|| format!("Failed to read USDA: {}", path.display()))?;
+            Ok(reader.into_specs())
         }
     }
 
@@ -409,6 +428,325 @@ impl ComposedLayer {
         }
     }
 
+    /// Compose references arcs for all prims in the specs.
+    ///
+    /// References are stronger than payloads but weaker than variants.
+    /// For each prim with a `references` field, load the referenced layer,
+    /// find the target prim, and merge its content under the referencing prim.
+    fn compose_references(specs: &mut HashMap<SdfPath, Spec>, base_dir: &Path, visited: &mut HashSet<PathBuf>) {
+        // Collect all prims that have references (to avoid borrowing issues)
+        let prims_with_refs: Vec<(SdfPath, Vec<crate::sdf::Reference>)> = specs
+            .iter()
+            .filter(|(_, spec)| spec.ty == SpecType::Prim)
+            .filter_map(|(path, spec)| {
+                let refs = Self::extract_references(spec);
+                if refs.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), refs))
+                }
+            })
+            .collect();
+
+        // Process each prim with references
+        for (prim_path, references) in prims_with_refs {
+            // Process references in order (first in list is strongest)
+            for reference in references.iter() {
+                // Skip internal references (empty asset path means same layer)
+                if reference.asset_path.is_empty() {
+                    Self::compose_internal_reference(specs, &prim_path, &reference.prim_path);
+                    continue;
+                }
+
+                // Resolve the external layer path
+                let resolved_path = match Self::resolve_sublayer_path(&reference.asset_path, base_dir) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                // Load the referenced layer
+                let ref_layer = match Self::open_recursive(&resolved_path, visited) {
+                    Ok(layer) => layer,
+                    Err(_) => continue,
+                };
+
+                // Determine the target prim path in the referenced layer
+                let target_path = if reference.prim_path.as_str().is_empty() {
+                    // Use default prim if no explicit prim path
+                    Self::get_default_prim_path(&ref_layer.specs)
+                } else {
+                    Some(reference.prim_path.clone())
+                };
+
+                let Some(target_path) = target_path else {
+                    continue;
+                };
+
+                // Remap and merge specs from the referenced layer
+                Self::compose_referenced_content(
+                    specs,
+                    &prim_path,
+                    &ref_layer.specs,
+                    &target_path,
+                    &reference.layer_offset,
+                );
+            }
+        }
+    }
+
+    /// Compose an internal reference (reference to prim in same layer).
+    fn compose_internal_reference(specs: &mut HashMap<SdfPath, Spec>, prim_path: &SdfPath, target_path: &SdfPath) {
+        if target_path.as_str().is_empty() {
+            return;
+        }
+
+        // Get fields from the target prim
+        let target_fields: HashMap<String, Value> = if let Some(target_spec) = specs.get(target_path) {
+            target_spec
+                .fields
+                .iter()
+                .filter(|(key, _)| {
+                    // Skip composition-specific fields
+                    *key != FieldKey::References.as_str()
+                        && *key != FieldKey::Payload.as_str()
+                        && *key != FieldKey::InheritPaths.as_str()
+                        && *key != FieldKey::Specializes.as_str()
+                        && *key != FieldKey::Specifier.as_str()
+                        && *key != FieldKey::TypeName.as_str()
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            return;
+        };
+
+        // Apply target fields to the prim (local opinions win)
+        if let Some(prim_spec) = specs.get_mut(prim_path) {
+            for (key, value) in target_fields {
+                prim_spec.fields.entry(key).or_insert(value);
+            }
+        }
+
+        // Also copy child properties from target
+        let target_prefix = target_path.as_str().to_string() + ".";
+        let properties_to_add: Vec<(SdfPath, Spec)> = specs
+            .iter()
+            .filter(|(path, _)| path.as_str().starts_with(&target_prefix))
+            .filter_map(|(path, spec)| {
+                let prop_name = &path.as_str()[target_prefix.len()..];
+                prim_path
+                    .append_property(prop_name)
+                    .ok()
+                    .map(|new_path| (new_path, spec.clone()))
+            })
+            .collect();
+
+        for (prop_path, prop_spec) in properties_to_add {
+            specs.entry(prop_path).or_insert(prop_spec);
+        }
+    }
+
+    /// Get the default prim path from the pseudo-root.
+    fn get_default_prim_path(specs: &HashMap<SdfPath, Spec>) -> Option<SdfPath> {
+        let root_spec = specs.get(&SdfPath::abs_root())?;
+        let default_prim = root_spec.fields.get(FieldKey::DefaultPrim.as_str())?;
+
+        match default_prim {
+            Value::Token(name) | Value::String(name) => SdfPath::new(&format!("/{}", name)).ok(),
+            _ => None,
+        }
+    }
+
+    /// Compose referenced content by remapping paths and merging specs.
+    fn compose_referenced_content(
+        specs: &mut HashMap<SdfPath, Spec>,
+        prim_path: &SdfPath,
+        ref_specs: &HashMap<SdfPath, Spec>,
+        target_path: &SdfPath,
+        layer_offset: &crate::sdf::LayerOffset,
+    ) {
+        let target_str = target_path.as_str();
+        let prim_str = prim_path.as_str();
+
+        // Merge fields from the target prim to the referencing prim
+        if let Some(target_spec) = ref_specs.get(target_path) {
+            let target_fields: HashMap<String, Value> = target_spec
+                .fields
+                .iter()
+                .filter(|(key, _)| {
+                    // Skip composition-specific fields
+                    *key != FieldKey::References.as_str()
+                        && *key != FieldKey::Payload.as_str()
+                        && *key != FieldKey::InheritPaths.as_str()
+                        && *key != FieldKey::Specializes.as_str()
+                        && *key != FieldKey::Specifier.as_str()
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            if let Some(prim_spec) = specs.get_mut(prim_path) {
+                for (key, mut value) in target_fields {
+                    // Apply layer offset to time samples
+                    if let Value::TimeSamples(samples) = &mut value {
+                        *samples = samples
+                            .iter()
+                            .map(|(time, val)| (layer_offset.apply(*time), val.clone()))
+                            .collect();
+                    }
+                    prim_spec.fields.entry(key).or_insert(value);
+                }
+            }
+        }
+
+        // Remap and add properties from the target prim
+        let target_prop_prefix = format!("{}.", target_str);
+        for (path, spec) in ref_specs.iter() {
+            if path.as_str().starts_with(&target_prop_prefix) {
+                let prop_name = &path.as_str()[target_prop_prefix.len()..];
+                if let Ok(new_path) = prim_path.append_property(prop_name) {
+                    let mut new_spec = spec.clone();
+                    Self::apply_layer_offset_to_spec(&mut new_spec, layer_offset);
+                    specs.entry(new_path).or_insert(new_spec);
+                }
+            }
+        }
+
+        // Remap and add child prims from the target
+        let target_child_prefix = format!("{}/", target_str);
+        for (path, spec) in ref_specs.iter() {
+            if path.as_str().starts_with(&target_child_prefix) {
+                let relative_path = &path.as_str()[target_str.len()..];
+                let new_path_str = format!("{}{}", prim_str, relative_path);
+                if let Ok(new_path) = SdfPath::new(&new_path_str) {
+                    let mut new_spec = spec.clone();
+                    Self::apply_layer_offset_to_spec(&mut new_spec, layer_offset);
+                    specs.entry(new_path).or_insert(new_spec);
+                }
+            }
+        }
+    }
+
+    /// Compose payloads arcs for all prims in the specs.
+    ///
+    /// Payloads are weaker than references but stronger than specializes.
+    /// For each prim with a `payload` field, load the payload layer,
+    /// find the target prim, and merge its content under the prim.
+    fn compose_payloads(specs: &mut HashMap<SdfPath, Spec>, base_dir: &Path, visited: &mut HashSet<PathBuf>) {
+        // Collect all prims that have payloads (to avoid borrowing issues)
+        let prims_with_payloads: Vec<(SdfPath, Vec<crate::sdf::Payload>)> = specs
+            .iter()
+            .filter(|(_, spec)| spec.ty == SpecType::Prim)
+            .filter_map(|(path, spec)| {
+                let payloads = Self::extract_payloads(spec);
+                if payloads.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), payloads))
+                }
+            })
+            .collect();
+
+        // Process each prim with payloads
+        for (prim_path, payloads) in prims_with_payloads {
+            // Process payloads in order (first in list is strongest)
+            for payload in payloads.iter() {
+                // Skip internal payloads (empty asset path)
+                if payload.asset_path.is_empty() {
+                    Self::compose_internal_reference(specs, &prim_path, &payload.prim_path);
+                    continue;
+                }
+
+                // Resolve the external layer path
+                let resolved_path = match Self::resolve_sublayer_path(&payload.asset_path, base_dir) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                // Load the payload layer
+                let payload_layer = match Self::open_recursive(&resolved_path, visited) {
+                    Ok(layer) => layer,
+                    Err(_) => continue,
+                };
+
+                // Determine the target prim path in the payload layer
+                let target_path = if payload.prim_path.as_str().is_empty() {
+                    // Use default prim if no explicit prim path
+                    Self::get_default_prim_path(&payload_layer.specs)
+                } else {
+                    Some(payload.prim_path.clone())
+                };
+
+                let Some(target_path) = target_path else {
+                    continue;
+                };
+
+                // Get layer offset (use default if None)
+                let layer_offset = payload.layer_offset.unwrap_or_default();
+
+                // Remap and merge specs from the payload layer
+                Self::compose_referenced_content(specs, &prim_path, &payload_layer.specs, &target_path, &layer_offset);
+            }
+        }
+    }
+
+    /// Extract references from a prim's spec.
+    ///
+    /// Returns references from the ReferenceListOp, combining explicit, prepended, appended, and added items.
+    fn extract_references(spec: &Spec) -> Vec<crate::sdf::Reference> {
+        let Some(value) = spec.fields.get(FieldKey::References.as_str()) else {
+            return vec![];
+        };
+
+        let Some(list_op) = value.clone().try_as_reference_list_op() else {
+            return vec![];
+        };
+
+        // Combine all items from the list op
+        let mut refs = Vec::new();
+
+        if list_op.explicit {
+            refs.extend(list_op.explicit_items);
+        } else {
+            refs.extend(list_op.prepended_items);
+            refs.extend(list_op.added_items);
+            refs.extend(list_op.appended_items);
+        }
+
+        // Filter out deleted items
+        refs.retain(|r| !list_op.deleted_items.contains(r));
+
+        refs
+    }
+
+    /// Extract payloads from a prim's spec.
+    ///
+    /// Returns payloads from the PayloadListOp, combining explicit, prepended, appended, and added items.
+    fn extract_payloads(spec: &Spec) -> Vec<crate::sdf::Payload> {
+        let Some(value) = spec.fields.get(FieldKey::Payload.as_str()) else {
+            return vec![];
+        };
+
+        let Some(list_op) = value.clone().try_as_payload_list_op() else {
+            return vec![];
+        };
+
+        // Combine all items from the list op
+        let mut payloads = Vec::new();
+
+        if list_op.explicit {
+            payloads.extend(list_op.explicit_items);
+        } else {
+            payloads.extend(list_op.prepended_items);
+            payloads.extend(list_op.added_items);
+            payloads.extend(list_op.appended_items);
+        }
+
+        // Filter out deleted items
+        payloads.retain(|p| !list_op.deleted_items.contains(p));
+
+        payloads
+    }
+
     /// Extract specializes paths from a prim's spec.
     ///
     /// Returns paths from the PathListOp, combining explicit, prepended, appended, and added items.
@@ -572,9 +910,7 @@ impl ComposedLayer {
                         .iter()
                         .filter(|(key, _)| {
                             // Skip composition-specific fields
-                            *key != FieldKey::Specifier.as_str()
-                                && *key != "primChildren"
-                                && *key != "propertyChildren"
+                            *key != FieldKey::Specifier.as_str() && *key != "primChildren" && *key != "propertyChildren"
                         })
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect()
@@ -628,9 +964,7 @@ impl ComposedLayer {
         // Collect paths that are direct children or deeper descendants
         let prims_to_add: Vec<(SdfPath, Spec)> = specs
             .iter()
-            .filter(|(path, spec)| {
-                path.as_str().starts_with(&child_prefix) && spec.ty == SpecType::Prim
-            })
+            .filter(|(path, spec)| path.as_str().starts_with(&child_prefix) && spec.ty == SpecType::Prim)
             .map(|(path, spec)| {
                 // Replace the variant prefix with the prim path
                 let relative_path = &path.as_str()[variant_str.len()..];
@@ -1616,18 +1950,28 @@ def Xform "Model" (
 
         // Check that the Model prim has the "detail" attribute from the selected variant
         let detail_path = sdf::path("/Model.detail").unwrap();
-        let detail_spec = composed.specs.get(&detail_path).expect("detail attribute should exist on Model");
+        let detail_spec = composed
+            .specs
+            .get(&detail_path)
+            .expect("detail attribute should exist on Model");
         let detail_value = detail_spec.fields.get("default").expect("default field");
         match detail_value {
             Value::Double(v) => {
-                assert!((v - 100.0).abs() < 0.001, "detail should be 100.0 from high variant, got {}", v);
+                assert!(
+                    (v - 100.0).abs() < 0.001,
+                    "detail should be 100.0 from high variant, got {}",
+                    v
+                );
             }
             _ => panic!("Expected Double, got {:?}", detail_value),
         }
 
         // Check that local opinion wins over variant
         let local_path = sdf::path("/Model.localValue").unwrap();
-        let local_spec = composed.specs.get(&local_path).expect("localValue attribute should exist");
+        let local_spec = composed
+            .specs
+            .get(&local_path)
+            .expect("localValue attribute should exist");
         let local_value = local_spec.fields.get("default").expect("default field");
         match local_value {
             Value::Double(v) => {
@@ -1649,7 +1993,10 @@ def Xform "Model" (
 
         // Check attribute on composed child prim
         let mesh_size_path = sdf::path("/Model/VariantMesh.meshSize").unwrap();
-        let mesh_size_spec = composed.specs.get(&mesh_size_path).expect("meshSize attribute should exist");
+        let mesh_size_spec = composed
+            .specs
+            .get(&mesh_size_path)
+            .expect("meshSize attribute should exist");
         let mesh_size_value = mesh_size_spec.fields.get("default").expect("default field");
         match mesh_size_value {
             Value::Double(v) => {
@@ -1657,6 +2004,417 @@ def Xform "Model" (
             }
             _ => panic!("Expected Double, got {:?}", mesh_size_value),
         }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_reference_basic() {
+        let temp_dir = create_temp_dir();
+
+        // Create the referenced layer
+        let ref_path = temp_dir.join("referenced.usda");
+        fs::write(
+            &ref_path,
+            r#"#usda 1.0
+(
+    defaultPrim = "RefPrim"
+)
+
+def Xform "RefPrim"
+{
+    double refValue = 42.0
+    string description = "from reference"
+
+    def Mesh "RefChild"
+    {
+        double childValue = 100.0
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        // Create root layer that references the other layer
+        let root_path = temp_dir.join("root.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    references = @./referenced.usda@
+)
+{
+    double localValue = 999.0
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that Model prim exists
+        let model_path = sdf::path("/Model").unwrap();
+        assert!(composed.specs.contains_key(&model_path), "Model should exist");
+
+        // Check that refValue was pulled in from the reference
+        let ref_value_path = sdf::path("/Model.refValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&ref_value_path),
+            "refValue should be composed from reference"
+        );
+
+        // Check the value
+        let ref_value_spec = composed.specs.get(&ref_value_path).expect("refValue should exist");
+        let ref_value = ref_value_spec.fields.get("default").expect("default field");
+        match ref_value {
+            Value::Double(v) => {
+                assert!((*v - 42.0).abs() < 0.001, "refValue should be 42.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", ref_value),
+        }
+
+        // Check that local opinion wins
+        let local_path = sdf::path("/Model.localValue").unwrap();
+        let local_spec = composed.specs.get(&local_path).expect("localValue should exist");
+        let local_value = local_spec.fields.get("default").expect("default field");
+        match local_value {
+            Value::Double(v) => {
+                assert!((*v - 999.0).abs() < 0.001, "localValue should be 999.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", local_value),
+        }
+
+        // Check that child prim from reference was composed
+        let ref_child_path = sdf::path("/Model/RefChild").unwrap();
+        assert!(
+            composed.specs.contains_key(&ref_child_path),
+            "RefChild should be composed from reference"
+        );
+
+        // Check child attribute
+        let child_value_path = sdf::path("/Model/RefChild.childValue").unwrap();
+        let child_value_spec = composed.specs.get(&child_value_path).expect("childValue should exist");
+        let child_value = child_value_spec.fields.get("default").expect("default field");
+        match child_value {
+            Value::Double(v) => {
+                assert!((*v - 100.0).abs() < 0.001, "childValue should be 100.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", child_value),
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_reference_with_prim_path() {
+        let temp_dir = create_temp_dir();
+
+        // Create the referenced layer with multiple prims
+        let ref_path = temp_dir.join("library.usda");
+        fs::write(
+            &ref_path,
+            r#"#usda 1.0
+(
+    defaultPrim = "DefaultPrim"
+)
+
+def Xform "DefaultPrim"
+{
+    double defaultValue = 1.0
+}
+
+def Xform "SpecificPrim"
+{
+    double specificValue = 2.0
+}
+"#,
+        )
+        .unwrap();
+
+        // Create root layer that references a specific prim
+        let root_path = temp_dir.join("root.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    references = @./library.usda@</SpecificPrim>
+)
+{
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that specificValue was pulled in (not defaultValue)
+        let specific_path = sdf::path("/Model.specificValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&specific_path),
+            "specificValue should be composed from reference"
+        );
+
+        // DefaultValue should not be present (we referenced SpecificPrim, not DefaultPrim)
+        let default_path = sdf::path("/Model.defaultValue").unwrap();
+        assert!(
+            !composed.specs.contains_key(&default_path),
+            "defaultValue should NOT be composed (wrong prim)"
+        );
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_payload_basic() {
+        let temp_dir = create_temp_dir();
+
+        // Create the payload layer
+        let payload_path = temp_dir.join("payload.usda");
+        fs::write(
+            &payload_path,
+            r#"#usda 1.0
+(
+    defaultPrim = "PayloadPrim"
+)
+
+def Xform "PayloadPrim"
+{
+    double payloadValue = 123.0
+
+    def Mesh "PayloadChild"
+    {
+        double childValue = 456.0
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        // Create root layer with payload
+        let root_path = temp_dir.join("root.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    payload = @./payload.usda@
+)
+{
+    double localValue = 999.0
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that payloadValue was pulled in
+        let payload_value_path = sdf::path("/Model.payloadValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&payload_value_path),
+            "payloadValue should be composed from payload"
+        );
+
+        // Check the value
+        let payload_spec = composed
+            .specs
+            .get(&payload_value_path)
+            .expect("payloadValue should exist");
+        let payload_value = payload_spec.fields.get("default").expect("default field");
+        match payload_value {
+            Value::Double(v) => {
+                assert!((*v - 123.0).abs() < 0.001, "payloadValue should be 123.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", payload_value),
+        }
+
+        // Check that local opinion wins
+        let local_path = sdf::path("/Model.localValue").unwrap();
+        let local_spec = composed.specs.get(&local_path).expect("localValue should exist");
+        let local_value = local_spec.fields.get("default").expect("default field");
+        match local_value {
+            Value::Double(v) => {
+                assert!((*v - 999.0).abs() < 0.001, "localValue should be 999.0, got {}", v);
+            }
+            _ => panic!("Expected Double, got {:?}", local_value),
+        }
+
+        // Check that child prim from payload was composed
+        let payload_child_path = sdf::path("/Model/PayloadChild").unwrap();
+        assert!(
+            composed.specs.contains_key(&payload_child_path),
+            "PayloadChild should be composed from payload"
+        );
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_reference_wins_over_payload() {
+        let temp_dir = create_temp_dir();
+
+        // Create the reference layer
+        let ref_path = temp_dir.join("reference.usda");
+        fs::write(
+            &ref_path,
+            r#"#usda 1.0
+(
+    defaultPrim = "RefPrim"
+)
+
+def Xform "RefPrim"
+{
+    string shared = "from reference"
+    double refOnly = 1.0
+}
+"#,
+        )
+        .unwrap();
+
+        // Create the payload layer
+        let payload_path = temp_dir.join("payload.usda");
+        fs::write(
+            &payload_path,
+            r#"#usda 1.0
+(
+    defaultPrim = "PayloadPrim"
+)
+
+def Xform "PayloadPrim"
+{
+    string shared = "from payload"
+    double payloadOnly = 2.0
+}
+"#,
+        )
+        .unwrap();
+
+        // Create root layer with both reference and payload
+        let root_path = temp_dir.join("root.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    references = @./reference.usda@
+    payload = @./payload.usda@
+)
+{
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that refOnly exists
+        let ref_only_path = sdf::path("/Model.refOnly").unwrap();
+        assert!(
+            composed.specs.contains_key(&ref_only_path),
+            "refOnly should be composed from reference"
+        );
+
+        // Check that payloadOnly exists
+        let payload_only_path = sdf::path("/Model.payloadOnly").unwrap();
+        assert!(
+            composed.specs.contains_key(&payload_only_path),
+            "payloadOnly should be composed from payload"
+        );
+
+        // Check that shared comes from reference (stronger than payload)
+        let shared_path = sdf::path("/Model.shared").unwrap();
+        let shared_spec = composed.specs.get(&shared_path).expect("shared should exist");
+        let shared_value = shared_spec.fields.get("default").expect("default field");
+        match shared_value {
+            Value::String(v) => {
+                assert_eq!(
+                    v, "from reference",
+                    "Reference should win over payload for shared field"
+                );
+            }
+            _ => panic!("Expected String, got {:?}", shared_value),
+        }
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_nested_references() {
+        let temp_dir = create_temp_dir();
+
+        // Create a deeply nested reference (layer A references layer B)
+        let layer_b = temp_dir.join("layer_b.usda");
+        fs::write(
+            &layer_b,
+            r#"#usda 1.0
+(
+    defaultPrim = "DeepPrim"
+)
+
+def Xform "DeepPrim"
+{
+    double deepValue = 999.0
+}
+"#,
+        )
+        .unwrap();
+
+        // Layer A references layer B
+        let layer_a = temp_dir.join("layer_a.usda");
+        fs::write(
+            &layer_a,
+            r#"#usda 1.0
+(
+    defaultPrim = "MiddlePrim"
+)
+
+def Xform "MiddlePrim" (
+    references = @./layer_b.usda@
+)
+{
+    double middleValue = 500.0
+}
+"#,
+        )
+        .unwrap();
+
+        // Root references layer A
+        let root_path = temp_dir.join("root.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    references = @./layer_a.usda@
+)
+{
+    double topValue = 100.0
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that topValue exists (local)
+        let top_path = sdf::path("/Model.topValue").unwrap();
+        assert!(composed.specs.contains_key(&top_path), "topValue should exist");
+
+        // Check that middleValue exists (from layer A)
+        let middle_path = sdf::path("/Model.middleValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&middle_path),
+            "middleValue should be composed from layer_a reference"
+        );
+
+        // Check that deepValue exists (from layer B via layer A)
+        let deep_path = sdf::path("/Model.deepValue").unwrap();
+        assert!(
+            composed.specs.contains_key(&deep_path),
+            "deepValue should be composed from nested reference"
+        );
 
         cleanup_temp_dir(&temp_dir);
     }

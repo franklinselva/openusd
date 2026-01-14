@@ -41,7 +41,9 @@ impl<'a> super::Parser<'a> {
             self.ensure_pun('=')?;
 
             // Get the selected variant value
-            let value = self.parse_token::<String>().context("Expected variant selection value")?;
+            let value = self
+                .parse_token::<String>()
+                .context("Expected variant selection value")?;
 
             selections.insert(name, value);
 
@@ -333,10 +335,7 @@ impl<'a> super::Parser<'a> {
                 spec.add(FieldKey::Documentation, sdf::Value::String(value));
             }
             n if n == FieldKey::VariantSelection.as_str() => {
-                ensure!(
-                    list_op.is_none(),
-                    "variants metadata does not support list ops"
-                );
+                ensure!(list_op.is_none(), "variants metadata does not support list ops");
                 let selections = self
                     .parse_variant_selection_map()
                     .context("Unable to parse variant selections")?;
@@ -347,7 +346,9 @@ impl<'a> super::Parser<'a> {
                 let names = if self.is_next(Token::Punctuation('[')) {
                     let mut collected = Vec::new();
                     self.parse_array_fn(|this| {
-                        let name = this.parse_token::<String>().context("Expected variant set name string")?;
+                        let name = this
+                            .parse_token::<String>()
+                            .context("Expected variant set name string")?;
                         collected.push(name);
                         Ok(())
                     })?;
@@ -363,7 +364,9 @@ impl<'a> super::Parser<'a> {
             // Application-specific boolean metadata (NVIDIA Omniverse, etc.)
             "hide_in_stage_window" | "no_delete" => {
                 ensure!(list_op.is_none(), "{name} metadata does not support list ops");
-                let value = self.parse_token::<bool>().with_context(|| format!("Unable to parse {name} flag"))?;
+                let value = self
+                    .parse_token::<bool>()
+                    .with_context(|| format!("Unable to parse {name} flag"))?;
                 spec.fields.insert(name.to_owned(), sdf::Value::Bool(value));
             }
             // Shader metadata dictionary (SDR = Shader Definition Registry)
@@ -376,7 +379,10 @@ impl<'a> super::Parser<'a> {
             }
             // Generic fallback for unknown metadata - try to parse as property metadata value
             other => {
-                ensure!(list_op.is_none(), "Unknown metadata '{other}' does not support list ops");
+                ensure!(
+                    list_op.is_none(),
+                    "Unknown metadata '{other}' does not support list ops"
+                );
                 let value = self
                     .parse_property_metadata_value()
                     .with_context(|| format!("Unable to parse unknown prim metadata: {other}"))?;
