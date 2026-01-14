@@ -360,7 +360,28 @@ impl<'a> super::Parser<'a> {
                     .context("Unable to build variantSetNames listOp")?;
                 spec.add(FieldKey::VariantSetNames, sdf::Value::StringListOp(list_op));
             }
-            other => bail!("Unsupported prim metadata: {other}"),
+            // Application-specific boolean metadata (NVIDIA Omniverse, etc.)
+            "hide_in_stage_window" | "no_delete" => {
+                ensure!(list_op.is_none(), "{name} metadata does not support list ops");
+                let value = self.parse_token::<bool>().with_context(|| format!("Unable to parse {name} flag"))?;
+                spec.fields.insert(name.to_owned(), sdf::Value::Bool(value));
+            }
+            // Shader metadata dictionary (SDR = Shader Definition Registry)
+            "sdrMetadata" => {
+                ensure!(list_op.is_none(), "sdrMetadata does not support list ops");
+                let value = self
+                    .parse_property_metadata_value()
+                    .context("Unable to parse sdrMetadata dictionary")?;
+                spec.fields.insert("sdrMetadata".to_owned(), value);
+            }
+            // Generic fallback for unknown metadata - try to parse as property metadata value
+            other => {
+                ensure!(list_op.is_none(), "Unknown metadata '{other}' does not support list ops");
+                let value = self
+                    .parse_property_metadata_value()
+                    .with_context(|| format!("Unable to parse unknown prim metadata: {other}"))?;
+                spec.fields.insert(other.to_owned(), value);
+            }
         }
 
         Ok(())

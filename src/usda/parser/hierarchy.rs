@@ -49,13 +49,13 @@ impl<'a> super::Parser<'a> {
 
         const KNOWN_PROPS: &[(&str, Type)] = &[
             (FieldKey::DefaultPrim.as_str(), Type::Token),
-            (FieldKey::StartTimeCode.as_str(), Type::Uint64),
+            (FieldKey::StartTimeCode.as_str(), Type::Double),
             (FieldKey::HasOwnedSubLayers.as_str(), Type::StringVec),
             ("doc", Type::String),
-            ("endTimeCode", Type::Uint64),
-            ("framesPerSecond", Type::Uint64),
+            ("endTimeCode", Type::Double),
+            ("framesPerSecond", Type::Double),
             ("metersPerUnit", Type::Double),
-            ("timeCodesPerSecond", Type::Uint64),
+            ("timeCodesPerSecond", Type::Double),
             ("upAxis", Type::Token),
         ];
 

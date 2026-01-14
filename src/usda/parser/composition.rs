@@ -8,28 +8,44 @@ use super::value::types::Type;
 
 /// Composition arc parsing functions.
 impl<'a> super::Parser<'a> {
-    /// Parse a reference arc (asset path + optional prim path + layer offset).
+    /// Parse a reference arc.
+    ///
+    /// Supports two formats:
+    /// - External reference: `@asset.usd@</Prim>` (asset path + optional prim path)
+    /// - Internal reference: `</Prim>` (prim path only, references within same layer)
     pub(super) fn parse_reference(&mut self) -> Result<sdf::Reference> {
-        let asset_path = self
-            .fetch_next()?
-            .try_as_asset_ref()
-            .ok_or_else(|| anyhow!("Asset reference expected"))?;
+        let first_token = self.fetch_next()?;
 
         let mut reference = sdf::Reference {
-            asset_path: asset_path.to_string(),
+            asset_path: String::new(),
             prim_path: sdf::Path::default(),
             layer_offset: sdf::LayerOffset::default(),
             custom_data: HashMap::new(),
         };
 
-        if matches!(self.peek_next(), Some(Ok(Token::PathRef(..)))) {
-            let path = self
-                .fetch_next()?
-                .try_as_path_ref()
-                .ok_or_else(|| anyhow!("Path reference expected"))?;
-            reference.prim_path = sdf::Path::new(path)?;
+        // Check if this is an external reference (starts with asset path) or internal (starts with prim path)
+        match first_token {
+            Token::AssetRef(asset_path) => {
+                // External reference: @asset.usd@ or @asset.usd@</Prim>
+                reference.asset_path = asset_path.to_string();
+
+                // Check for optional prim path
+                if matches!(self.peek_next(), Some(Ok(Token::PathRef(..)))) {
+                    let path = self
+                        .fetch_next()?
+                        .try_as_path_ref()
+                        .ok_or_else(|| anyhow!("Path reference expected"))?;
+                    reference.prim_path = sdf::Path::new(path)?;
+                }
+            }
+            Token::PathRef(path) => {
+                // Internal reference: </Prim> (no asset path, same layer)
+                reference.prim_path = sdf::Path::new(path)?;
+            }
+            other => bail!("Expected asset reference (@...@) or path reference (<...>), got: {other:?}"),
         }
 
+        // Parse optional layer offset
         if self.is_next(Token::Punctuation('(')) {
             self.parse_reference_layer_offset(&mut reference.layer_offset)
                 .context("Unable to parse reference layer offset")?;

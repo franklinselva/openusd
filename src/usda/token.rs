@@ -25,9 +25,12 @@ pub enum Token<'source> {
     /// Single-quoted strings
     /// Example: 'hello world' -> hello world
     #[regex(r#"'([^'\\]|\\.)*'"#, |lex| trim_chars(lex.slice(), 1))]
-    /// Triple-quoted strings
+    /// Triple double-quoted strings
     /// Example: """multi-line string""" -> multi-line string
     #[regex(r#""""([^"]|"[^"]|""[^"])*""""#, |lex| trim_chars(lex.slice(), 3))]
+    /// Triple single-quoted strings
+    /// Example: '''multi-line string''' -> multi-line string
+    #[regex(r"'''([^']|'[^']|''[^'])*'''", |lex| trim_chars(lex.slice(), 3))]
     /// Triple-@ delimited strings
     /// Example: @@@raw string@@@ -> raw string
     #[regex(r#"@@@([^@]|@[^@]|@@[^@])*@@@"#, |lex| trim_chars(lex.slice(), 3))]

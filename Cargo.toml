@@ -18,3 +18,18 @@ num-traits = "0.2.17"
 half = { version = "2.3.1", features = ["bytemuck", "num-traits"] }
 logos = "0.16.0"
 zip = { version = "7.0.0", default-features = false, features = ["deflate"] }
+
+# CLI validation tool dependencies
+clap = { version = "4", features = ["derive"], optional = true }
+rayon = { version = "1", optional = true }
+indicatif = { version = "0.17", optional = true }
+walkdir = { version = "2", optional = true }
+
+[features]
+default = []
+cli = ["clap", "rayon", "indicatif", "walkdir"]
+
+[[bin]]
+name = "validate_usd"
+path = "src/bin/validate_usd.rs"
+required-features = ["cli"]

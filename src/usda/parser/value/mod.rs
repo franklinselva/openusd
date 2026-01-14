@@ -5,12 +5,20 @@ pub mod types;
 use anyhow::Result;
 
 use crate::sdf;
+use crate::usda::token::Token;
 pub use types::Type;
 
 /// Value parsing dispatcher.
 impl<'a> super::Parser<'a> {
     /// Decode a typed value based on USD's scalar/array/role type tables.
     pub(super) fn parse_value(&mut self, ty: Type) -> Result<sdf::Value> {
+        // Handle `None` token - represents a blocked/cleared value in USD.
+        // For array types, return an empty array.
+        if self.is_next(Token::None) {
+            self.fetch_next()?; // consume the None token
+            return Ok(Self::empty_value_for_type(ty));
+        }
+
         let value = match ty {
             // Bool
             Type::Bool => sdf::Value::Bool(self.parse_bool()?),
@@ -91,5 +99,87 @@ impl<'a> super::Parser<'a> {
         };
 
         Ok(value)
+    }
+
+    /// Return an empty/default value for the given type.
+    /// Used when parsing `None` which represents a blocked/cleared value.
+    fn empty_value_for_type(ty: Type) -> sdf::Value {
+        match ty {
+            // Bool
+            Type::Bool => sdf::Value::Bool(false),
+            Type::BoolVec => sdf::Value::BoolVec(vec![]),
+
+            // Asset paths
+            Type::Asset => sdf::Value::AssetPath(String::new()),
+            Type::AssetVec => sdf::Value::StringVec(vec![]),
+
+            // Ints
+            Type::Uchar => sdf::Value::Uchar(0),
+            Type::UcharVec => sdf::Value::UcharVec(vec![]),
+            Type::Int => sdf::Value::Int(0),
+            Type::Int2 => sdf::Value::Vec2i(vec![]),
+            Type::Int3 => sdf::Value::Vec3i(vec![]),
+            Type::Int4 => sdf::Value::Vec4i(vec![]),
+            Type::IntVec => sdf::Value::IntVec(vec![]),
+            Type::Int2Vec => sdf::Value::Vec2i(vec![]),
+            Type::Int3Vec => sdf::Value::Vec3i(vec![]),
+            Type::Int4Vec => sdf::Value::Vec4i(vec![]),
+            Type::Uint => sdf::Value::Uint(0),
+            Type::Int64 => sdf::Value::Int64(0),
+            Type::Int64Vec => sdf::Value::Int64Vec(vec![]),
+            Type::Uint64 => sdf::Value::Uint64(0),
+
+            // Half
+            Type::Half => sdf::Value::Half(half::f16::ZERO),
+            Type::Half2 => sdf::Value::HalfVec(vec![]),
+            Type::Half3 => sdf::Value::Vec3h(vec![]),
+            Type::Half4 => sdf::Value::Vec4h(vec![]),
+            Type::HalfVec => sdf::Value::HalfVec(vec![]),
+            Type::Half2Vec => sdf::Value::Vec2h(vec![]),
+            Type::Half3Vec => sdf::Value::Vec3h(vec![]),
+            Type::Half4Vec => sdf::Value::Vec4h(vec![]),
+
+            // Float
+            Type::Float => sdf::Value::Float(0.0),
+            Type::Float2 => sdf::Value::Vec2f(vec![]),
+            Type::Float3 => sdf::Value::Vec3f(vec![]),
+            Type::Float4 => sdf::Value::Vec4f(vec![]),
+            Type::FloatVec => sdf::Value::FloatVec(vec![]),
+            Type::Float2Vec => sdf::Value::Vec2f(vec![]),
+            Type::Float3Vec => sdf::Value::Vec3f(vec![]),
+            Type::Float4Vec => sdf::Value::Vec4f(vec![]),
+
+            // Double
+            Type::Double => sdf::Value::Double(0.0),
+            Type::Double2 => sdf::Value::Vec2d(vec![]),
+            Type::Double3 => sdf::Value::Vec3d(vec![]),
+            Type::Double4 => sdf::Value::Vec4d(vec![]),
+            Type::DoubleVec => sdf::Value::DoubleVec(vec![]),
+            Type::Double2Vec => sdf::Value::Vec2d(vec![]),
+            Type::Double3Vec => sdf::Value::Vec3d(vec![]),
+            Type::Double4Vec => sdf::Value::Vec4d(vec![]),
+
+            // Quats
+            Type::Quath => sdf::Value::Quath(vec![]),
+            Type::Quatf => sdf::Value::Quatf(vec![]),
+            Type::Quatd => sdf::Value::Quatd(vec![]),
+            Type::QuathVec => sdf::Value::Quath(vec![]),
+            Type::QuatfVec => sdf::Value::Quatf(vec![]),
+            Type::QuatdVec => sdf::Value::Quatd(vec![]),
+
+            // String and tokens
+            Type::String => sdf::Value::String(String::new()),
+            Type::Token => sdf::Value::Token(String::new()),
+            Type::StringVec => sdf::Value::StringVec(vec![]),
+            Type::TokenVec => sdf::Value::TokenVec(vec![]),
+
+            // Matrices
+            Type::Matrix2d => sdf::Value::Matrix2d(vec![]),
+            Type::Matrix3d => sdf::Value::Matrix3d(vec![]),
+            Type::Matrix4d => sdf::Value::Matrix4d(vec![]),
+
+            // Dictionary
+            Type::Dictionary => sdf::Value::Dictionary(std::collections::HashMap::new()),
+        }
     }
 }
