@@ -120,12 +120,11 @@ impl<'a> super::Parser<'a> {
             }
         };
 
+        // Check for optional type specifier (valid for def, over, and class)
         let mut name_token = self.fetch_next()?;
-        if specifier == sdf::Specifier::Def || specifier == sdf::Specifier::Class {
-            if let Some(prim_type) = name_token.clone().try_as_identifier() {
-                spec.add(FieldKey::TypeName, sdf::Value::Token(prim_type.to_string()));
-                name_token = self.fetch_next()?;
-            }
+        if let Some(prim_type) = name_token.clone().try_as_identifier() {
+            spec.add(FieldKey::TypeName, sdf::Value::Token(prim_type.to_string()));
+            name_token = self.fetch_next()?;
         }
 
         let name = name_token
@@ -186,6 +185,19 @@ impl<'a> super::Parser<'a> {
                     self.fetch_next()?;
                     self.read_relationship(&prim_path, &mut properties, data)
                         .context("Unable to read relationship")?;
+                }
+                // Handle list ops that may prefix relationships: prepend rel, add rel, etc.
+                Token::Add | Token::Append | Token::Delete | Token::Prepend | Token::Reorder => {
+                    // Peek ahead to check if this is a relationship or attribute
+                    let list_op = self.fetch_next()?;
+                    if self.is_next(Token::Rel) {
+                        self.fetch_next()?; // consume 'rel'
+                        self.read_relationship_with_list_op(&prim_path, &mut properties, data, list_op)
+                            .context("Unable to read relationship")?;
+                    } else {
+                        self.read_attribute_with_list_op(&prim_path, &mut properties, data, list_op)
+                            .context("Unable to read attribute")?;
+                    }
                 }
                 _ => {
                     self.read_attribute(&prim_path, &mut properties, data)
@@ -286,7 +298,17 @@ impl<'a> super::Parser<'a> {
         }
 
         self.ensure_pun('=')?;
-        let value = self.parse_value(data_type)?;
+
+        // Check for time samples: attribute.timeSamples = { time: value, ... }
+        let (value, is_time_samples) = if self.is_next(Token::Punctuation('{')) {
+            let samples = self
+                .parse_time_samples(data_type)
+                .context("Unable to parse time samples")?;
+            (sdf::Value::TimeSamples(samples), true)
+        } else {
+            (self.parse_value(data_type)?, false)
+        };
+
         let path = current_path.append_property(name)?;
 
         // Check for metadata after value (could appear here instead of before)
@@ -300,7 +322,11 @@ impl<'a> super::Parser<'a> {
         spec.add(FieldKey::Custom, sdf::Value::Bool(custom));
         spec.add(FieldKey::Variability, sdf::Value::Variability(variability));
         spec.add(FieldKey::TypeName, sdf::Value::Token(type_name.to_string()));
-        spec.add(FieldKey::Default, value);
+        if is_time_samples {
+            spec.add(FieldKey::TimeSamples, value);
+        } else {
+            spec.add(FieldKey::Default, value);
+        }
         data.insert(path, spec);
 
         Ok(())
@@ -375,8 +401,89 @@ impl<'a> super::Parser<'a> {
         Ok(())
     }
 
+    /// Parse a relationship declaration with a pre-consumed list operation prefix.
+    ///
+    /// Handles syntax like: `prepend rel myRel = [<path>]`
+    /// where the list op token has already been consumed by the caller.
+    pub(super) fn read_relationship_with_list_op(
+        &mut self,
+        current_path: &sdf::Path,
+        properties: &mut Vec<String>,
+        data: &mut HashMap<sdf::Path, sdf::Spec>,
+        list_op_token: Token<'a>,
+    ) -> Result<()> {
+        let name_token = self.fetch_next()?;
+        let name = match name_token {
+            Token::Identifier(s) | Token::NamespacedIdentifier(s) => s,
+            other => bail!("Unexpected token in relationship declaration: {other:?}"),
+        };
+
+        let mut spec = sdf::Spec::new(sdf::SpecType::Relationship);
+
+        // Check for metadata before assignment
+        if self.is_next(Token::Punctuation('(')) {
+            self.parse_property_metadata(&mut spec)
+                .context("Unable to parse relationship metadata")?;
+        }
+
+        // For prepend/append/etc. relationships, expect an assignment
+        self.ensure_pun('=')?;
+        let targets = self
+            .parse_connection_targets()
+            .context("Unable to parse relationship targets")?;
+
+        let path = current_path.append_property(name)?;
+        properties.push(name.to_string());
+
+        let list_op = self
+            .apply_list_op(Some(list_op_token), targets)
+            .context("Unable to build relationship targets listOp")?;
+        spec.add(FieldKey::TargetPaths, sdf::Value::PathListOp(list_op));
+        spec.add(FieldKey::Custom, sdf::Value::Bool(false));
+        spec.add(
+            FieldKey::Variability,
+            sdf::Value::Variability(sdf::Variability::Varying),
+        );
+
+        if self.is_next(Token::Punctuation('(')) {
+            self.parse_property_metadata(&mut spec)
+                .context("Unable to parse relationship metadata")?;
+        }
+
+        data.insert(path, spec);
+        Ok(())
+    }
+
+    /// Parse an attribute declaration with a pre-consumed list operation prefix.
+    ///
+    /// Handles syntax like: `prepend asset[] myAttr = [@file@]`
+    /// where the list op token has already been consumed by the caller.
+    pub(super) fn read_attribute_with_list_op(
+        &mut self,
+        current_path: &sdf::Path,
+        properties: &mut Vec<String>,
+        data: &mut HashMap<sdf::Path, sdf::Spec>,
+        _list_op_token: Token<'a>,
+    ) -> Result<()> {
+        // For now, just delegate to the regular read_attribute
+        // The list_op will be ignored since attributes don't use list ops in the same way
+        // In practice, list ops before attributes are rare - they're typically used for relationships
+        self.read_attribute(current_path, properties, data)
+    }
+
     /// Parses a connection target list into USD paths.
+    ///
+    /// Handles:
+    /// - `None` - Empty target list
+    /// - `<path>` - Single target
+    /// - `[<path1>, <path2>]` - Multiple targets
     pub(super) fn parse_connection_targets(&mut self) -> Result<Vec<sdf::Path>> {
+        // Handle None value (empty relationship)
+        if self.is_next(Token::None) {
+            self.fetch_next()?;
+            return Ok(Vec::new());
+        }
+
         if self.is_next(Token::Punctuation('[')) {
             let mut paths = Vec::new();
             self.parse_array_fn(|this| {
@@ -397,6 +504,56 @@ impl<'a> super::Parser<'a> {
             .try_as_path_ref()
             .ok_or_else(|| anyhow!("Path reference expected, got {token:?}"))?;
         sdf::Path::new(path_str)
+    }
+
+    /// Parse time samples in the format `{ time: value, time: value, ... }`.
+    ///
+    /// Example:
+    /// ```text
+    /// double3 xformOp:translate.timeSamples = {
+    ///     0: (0, 0, 0),
+    ///     100: (100, 0, 0),
+    /// }
+    /// ```
+    pub(super) fn parse_time_samples(
+        &mut self,
+        data_type: super::value::types::Type,
+    ) -> Result<sdf::TimeSampleMap> {
+        self.ensure_pun('{').context("Time samples must start with {")?;
+
+        let mut samples = Vec::new();
+
+        loop {
+            // Check for closing brace
+            if self.is_next(Token::Punctuation('}')) {
+                self.fetch_next()?;
+                break;
+            }
+
+            // Parse the time (a number)
+            let time_token = self.fetch_next()?;
+            let time = match time_token {
+                Token::Number(n) => n
+                    .parse::<f64>()
+                    .with_context(|| format!("Unable to parse time sample time: {n}"))?,
+                other => bail!("Expected number for time sample time, got: {other:?}"),
+            };
+
+            // Expect colon separator
+            self.ensure_pun(':').context("Expected ':' after time in time sample")?;
+
+            // Parse the value
+            let value = self.parse_value(data_type)?;
+
+            samples.push((time, value));
+
+            // Handle optional trailing comma
+            if self.is_next(Token::Punctuation(',')) {
+                self.fetch_next()?;
+            }
+        }
+
+        Ok(samples)
     }
 
     /// Parse a variantSet block within a prim.
@@ -442,6 +599,14 @@ impl<'a> super::Parser<'a> {
             // Create a spec for this variant
             let mut variant_spec = sdf::Spec::new(sdf::SpecType::Variant);
 
+            // Check for optional variant metadata: "variantName" (metadata) { ... }
+            if self.is_next(Token::Punctuation('(')) {
+                self.fetch_next()?;
+                self.read_prim_metadata(&mut variant_spec, None)
+                    .context("Unable to parse variant metadata")?;
+                self.ensure_pun(')').context("Variant metadata must end with )")?;
+            }
+
             // Parse the variant body
             self.ensure_pun('{').context("Expected '{' to start variant body")?;
 
@@ -464,10 +629,37 @@ impl<'a> super::Parser<'a> {
                         self.read_prim(&variant_path, &mut variant_prim_children, data)
                             .context("Unable to read nested prim in variant")?;
                     }
+                    Token::VariantSet => {
+                        self.fetch_next()?;
+                        self.read_variant_set(&variant_path, data)
+                            .context("Unable to read nested variant set in variant")?;
+                    }
                     Token::Rel => {
                         self.fetch_next()?;
                         self.read_relationship(&variant_path, &mut variant_properties, data)
                             .context("Unable to read relationship in variant")?;
+                    }
+                    // Handle list ops that may prefix relationships: prepend rel, add rel, etc.
+                    Token::Add | Token::Append | Token::Delete | Token::Prepend | Token::Reorder => {
+                        let list_op = self.fetch_next()?;
+                        if self.is_next(Token::Rel) {
+                            self.fetch_next()?; // consume 'rel'
+                            self.read_relationship_with_list_op(
+                                &variant_path,
+                                &mut variant_properties,
+                                data,
+                                list_op,
+                            )
+                            .context("Unable to read relationship in variant")?;
+                        } else {
+                            self.read_attribute_with_list_op(
+                                &variant_path,
+                                &mut variant_properties,
+                                data,
+                                list_op,
+                            )
+                            .context("Unable to read attribute in variant")?;
+                        }
                     }
                     _ => {
                         self.read_attribute(&variant_path, &mut variant_properties, data)

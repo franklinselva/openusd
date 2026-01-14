@@ -7,17 +7,22 @@
 use logos::Logos;
 
 #[derive(Logos, Debug, Clone, PartialEq, Eq, Hash, strum::Display, strum::EnumIs, strum::EnumTryAs)]
-#[logos(skip r"[ \t\n\f]+")] // Skip whitespace
-#[logos(skip r"#[^\n]*")] // Skip comments
+#[logos(skip r"[ \t\r\n\f]+")] // Skip whitespace (including \r for Windows line endings)
 pub enum Token<'source> {
     /// Magic header - extract version number
     /// Example: "#usda 1.0" -> "1.0"
-    #[regex(r"#usda ([0-9]+\.[0-9]+)", |lex| {
+    /// Priority 10 ensures it wins over Comment for lines starting with #usda
+    #[regex(r"#usda ([0-9]+\.[0-9]+)", priority = 10, callback = |lex| {
         let s = lex.slice();
         // Extract version after "#usda "
         &s[6..]
     })]
     Magic(&'source str),
+
+    /// Comment line (starts with # but not #usda)
+    /// These are skipped during parsing
+    #[regex(r"#[^\r\n]*", allow_greedy = true)]
+    Comment,
 
     /// Double-quoted strings
     /// Example: "hello world" -> hello world
@@ -139,8 +144,8 @@ pub enum Token<'source> {
     AssetRef(&'source str),
 
     /// Punctuation characters
-    /// Examples: "=", ",", ";", "(", ")", "{", "}", "[", "]", "+", "-"
-    #[regex(r"[=,;()\{\}\[\]+\-]", |lex| lex.slice().chars().next().unwrap())]
+    /// Examples: "=", ",", ";", "(", ")", "{", "}", "[", "]", "+", "-", ":"
+    #[regex(r"[=,;:()\{\}\[\]+\-]", |lex| lex.slice().chars().next().unwrap())]
     Punctuation(char),
 
     /// Namespaced identifiers (contains colon)

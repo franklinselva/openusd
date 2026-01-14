@@ -34,6 +34,41 @@ impl Archive {
         Ok(Self { archive })
     }
 
+    /// Returns the number of files in the archive.
+    pub fn len(&self) -> usize {
+        self.archive.len()
+    }
+
+    /// Returns true if the archive is empty.
+    pub fn is_empty(&self) -> bool {
+        self.archive.is_empty()
+    }
+
+    /// Returns the name of the file at the given index.
+    pub fn name_at(&mut self, index: usize) -> Option<String> {
+        self.archive.by_index(index).ok().map(|f| f.name().to_string())
+    }
+
+    /// Returns a list of all file names in the archive.
+    pub fn file_names(&self) -> Vec<String> {
+        self.archive.file_names().map(|s| s.to_string()).collect()
+    }
+
+    /// Find the root USD layer in the archive.
+    ///
+    /// According to the USDZ specification, the root layer is typically the first
+    /// USD file (.usdc, .usda, or .usd) encountered in the archive. This method
+    /// iterates through all files and returns the path to the first USD file found.
+    pub fn find_root_layer(&self) -> Option<String> {
+        for name in self.archive.file_names() {
+            let lower = name.to_lowercase();
+            if lower.ends_with(".usdc") || lower.ends_with(".usda") || lower.ends_with(".usd") {
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+
     /// Read either a USDA or USDC file from the archive.
     ///
     /// NOTE: Nested USDZ files are not yet supported.

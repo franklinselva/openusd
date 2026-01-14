@@ -7,16 +7,28 @@ type LexResult<'source> = std::result::Result<Token<'source>, ()>;
 /// Token stream operations.
 impl<'a> super::Parser<'a> {
     /// Fetch the next token from the stream and update the last span.
+    /// Automatically skips Comment tokens.
     #[inline]
     pub(super) fn fetch_next(&mut self) -> Result<Token<'a>> {
-        let (token, span) = self.iter.next().context("Unexpected end of tokens")?;
-        self.last_span = Some(span);
-        token.map_err(|e| anyhow!("Logos error: {e:?}"))
+        loop {
+            let (token, span) = self.iter.next().context("Unexpected end of tokens")?;
+            self.last_span = Some(span);
+            let token = token.map_err(|e| anyhow!("Logos error: {e:?}"))?;
+            // Skip comment tokens
+            if !matches!(token, Token::Comment) {
+                return Ok(token);
+            }
+        }
     }
 
     /// Peek at the next token without consuming it.
+    /// Automatically skips Comment tokens.
     #[inline]
     pub(super) fn peek_next(&mut self) -> Option<&LexResult<'a>> {
+        // Skip any comment tokens by consuming them
+        while matches!(self.iter.peek(), Some((Ok(Token::Comment), _))) {
+            self.iter.next();
+        }
         self.iter.peek().map(|(token, _)| token)
     }
 
