@@ -180,7 +180,14 @@ mod tests {
         let mut lexer = Token::lexer(input);
 
         for (expected_token, expected_str) in expected_tokens {
-            let token = lexer.next().expect("Unexpected end of tokens").unwrap();
+            // Skip comment tokens
+            let mut token;
+            loop {
+                token = lexer.next().expect("Unexpected end of tokens").unwrap();
+                if !matches!(token, Token::Comment) {
+                    break;
+                }
+            }
 
             // For string-bearing tokens, check the string content matches
             match &token {

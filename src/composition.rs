@@ -20,7 +20,7 @@ use crate::usda::TextReader;
 use crate::usdc::CrateData;
 
 /// A composed layer that includes content from all sublayers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ComposedLayer {
     /// The composed specs from this layer and all sublayers.
     pub specs: HashMap<SdfPath, Spec>,
@@ -28,6 +28,23 @@ pub struct ComposedLayer {
     pub source_path: PathBuf,
     /// Paths of all layers that were composed (for debugging).
     pub composed_layers: Vec<PathBuf>,
+}
+
+/// Context for composition tracking, including cycle detection and caching.
+struct CompositionContext {
+    /// Paths currently being processed (for cycle detection)
+    processing: HashSet<PathBuf>,
+    /// Cache of already composed layers
+    cache: HashMap<PathBuf, ComposedLayer>,
+}
+
+impl CompositionContext {
+    fn new() -> Self {
+        Self {
+            processing: HashSet::new(),
+            cache: HashMap::new(),
+        }
+    }
 }
 
 impl ComposedLayer {
@@ -39,18 +56,23 @@ impl ComposedLayer {
     /// 3. Merge specs according to USD composition rules
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut visited = HashSet::new();
+        let mut ctx = CompositionContext::new();
         let canonical = path
             .canonicalize()
             .with_context(|| format!("Failed to canonicalize path: {}", path.display()))?;
 
-        Self::open_recursive(&canonical, &mut visited)
+        Self::open_recursive(&canonical, &mut ctx)
     }
 
     /// Internal recursive layer loading.
-    fn open_recursive(path: &Path, visited: &mut HashSet<PathBuf>) -> Result<Self> {
-        // Check for circular references
-        if visited.contains(path) {
+    fn open_recursive(path: &Path, ctx: &mut CompositionContext) -> Result<Self> {
+        // Check if we already have this layer cached
+        if let Some(cached) = ctx.cache.get(path) {
+            return Ok(cached.clone());
+        }
+
+        // Check for circular references (path is currently being processed)
+        if ctx.processing.contains(path) {
             // Circular reference detected, return empty layer
             return Ok(ComposedLayer {
                 specs: HashMap::new(),
@@ -58,7 +80,9 @@ impl ComposedLayer {
                 composed_layers: vec![],
             });
         }
-        visited.insert(path.to_path_buf());
+
+        // Mark this path as being processed
+        ctx.processing.insert(path.to_path_buf());
 
         // Parse the layer based on file extension
         let specs = Self::parse_layer(path)?;
@@ -78,17 +102,22 @@ impl ComposedLayer {
             // V - Variants
             Self::compose_variants(&mut specs);
             // R - References
-            Self::compose_references(&mut specs, base_dir, visited);
+            Self::compose_references(&mut specs, base_dir, ctx);
             // P - Payloads
-            Self::compose_payloads(&mut specs, base_dir, visited);
+            Self::compose_payloads(&mut specs, base_dir, ctx);
             // S - Specializes
             Self::compose_specializes(&mut specs);
 
-            return Ok(ComposedLayer {
+            let result = ComposedLayer {
                 specs,
                 source_path: path.to_path_buf(),
                 composed_layers: vec![path.to_path_buf()],
-            });
+            };
+
+            // Cache the result and remove from processing
+            ctx.processing.remove(path);
+            ctx.cache.insert(path.to_path_buf(), result.clone());
+            return Ok(result);
         }
 
         // Load and compose sublayers (in reverse order - last sublayer is weakest)
@@ -113,14 +142,15 @@ impl ComposedLayer {
                 Err(_) => continue,
             };
 
-            match Self::open_recursive(&resolved_path, visited) {
+            match Self::open_recursive(&resolved_path, ctx) {
                 Ok(sublayer) => {
                     // Merge sublayer specs into composed specs
-                    // Later (stronger) layers will override
+                    // Later (stronger) layers will override fields, but weaker layer fields are preserved
                     for (path, mut spec) in sublayer.specs {
                         // Apply layer offset to time samples in this spec
-                        Self::apply_layer_offset_to_spec(&mut spec, layer_offset);
-                        composed_specs.insert(path, spec);
+                        Self::apply_layer_offset_to_spec(&mut spec, &layer_offset);
+                        // Use merge_spec to preserve fields from weaker layers
+                        Self::merge_spec(&mut composed_specs, path, spec);
                     }
 
                     all_composed_layers.extend(sublayer.composed_layers);
@@ -144,17 +174,22 @@ impl ComposedLayer {
         // V - Variants (selected variant content)
         Self::compose_variants(&mut composed_specs);
         // R - References
-        Self::compose_references(&mut composed_specs, base_dir, visited);
+        Self::compose_references(&mut composed_specs, base_dir, ctx);
         // P - Payloads
-        Self::compose_payloads(&mut composed_specs, base_dir, visited);
+        Self::compose_payloads(&mut composed_specs, base_dir, ctx);
         // S - Specializes (weakest arc)
         Self::compose_specializes(&mut composed_specs);
 
-        Ok(ComposedLayer {
+        let result = ComposedLayer {
             specs: composed_specs,
             source_path: path.to_path_buf(),
             composed_layers: all_composed_layers,
-        })
+        };
+
+        // Cache the result and remove from processing
+        ctx.processing.remove(path);
+        ctx.cache.insert(path.to_path_buf(), result.clone());
+        Ok(result)
     }
 
     /// Parse a layer file based on its extension and content.
@@ -433,7 +468,7 @@ impl ComposedLayer {
     /// References are stronger than payloads but weaker than variants.
     /// For each prim with a `references` field, load the referenced layer,
     /// find the target prim, and merge its content under the referencing prim.
-    fn compose_references(specs: &mut HashMap<SdfPath, Spec>, base_dir: &Path, visited: &mut HashSet<PathBuf>) {
+    fn compose_references(specs: &mut HashMap<SdfPath, Spec>, base_dir: &Path, ctx: &mut CompositionContext) {
         // Collect all prims that have references (to avoid borrowing issues)
         let prims_with_refs: Vec<(SdfPath, Vec<crate::sdf::Reference>)> = specs
             .iter()
@@ -465,7 +500,7 @@ impl ComposedLayer {
                 };
 
                 // Load the referenced layer
-                let ref_layer = match Self::open_recursive(&resolved_path, visited) {
+                let ref_layer = match Self::open_recursive(&resolved_path, ctx) {
                     Ok(layer) => layer,
                     Err(_) => continue,
                 };
@@ -613,6 +648,8 @@ impl ComposedLayer {
 
         // Remap and add child prims from the target
         let target_child_prefix = format!("{}/", target_str);
+        let mut direct_children: Vec<String> = Vec::new();
+
         for (path, spec) in ref_specs.iter() {
             if path.as_str().starts_with(&target_child_prefix) {
                 let relative_path = &path.as_str()[target_str.len()..];
@@ -621,7 +658,34 @@ impl ComposedLayer {
                     let mut new_spec = spec.clone();
                     Self::apply_layer_offset_to_spec(&mut new_spec, layer_offset);
                     specs.entry(new_path).or_insert(new_spec);
+
+                    // Track direct children (one level deep, prim specs only)
+                    if spec.ty == SpecType::Prim && !relative_path[1..].contains('/') {
+                        let child_name = relative_path.trim_start_matches('/').to_string();
+                        if !direct_children.contains(&child_name) {
+                            direct_children.push(child_name);
+                        }
+                    }
                 }
+            }
+        }
+
+        // Update primChildren on the parent prim to include newly added children
+        if !direct_children.is_empty() {
+            if let Some(prim_spec) = specs.get_mut(prim_path) {
+                let mut existing_children = prim_spec
+                    .fields
+                    .get("primChildren")
+                    .and_then(|v| v.clone().try_as_token_vec())
+                    .unwrap_or_default();
+
+                for child_name in direct_children {
+                    if !existing_children.contains(&child_name) {
+                        existing_children.push(child_name);
+                    }
+                }
+
+                prim_spec.add("primChildren", Value::TokenVec(existing_children));
             }
         }
     }
@@ -631,7 +695,7 @@ impl ComposedLayer {
     /// Payloads are weaker than references but stronger than specializes.
     /// For each prim with a `payload` field, load the payload layer,
     /// find the target prim, and merge its content under the prim.
-    fn compose_payloads(specs: &mut HashMap<SdfPath, Spec>, base_dir: &Path, visited: &mut HashSet<PathBuf>) {
+    fn compose_payloads(specs: &mut HashMap<SdfPath, Spec>, base_dir: &Path, ctx: &mut CompositionContext) {
         // Collect all prims that have payloads (to avoid borrowing issues)
         let prims_with_payloads: Vec<(SdfPath, Vec<crate::sdf::Payload>)> = specs
             .iter()
@@ -663,7 +727,7 @@ impl ComposedLayer {
                 };
 
                 // Load the payload layer
-                let payload_layer = match Self::open_recursive(&resolved_path, visited) {
+                let payload_layer = match Self::open_recursive(&resolved_path, ctx) {
                     Ok(layer) => layer,
                     Err(_) => continue,
                 };
