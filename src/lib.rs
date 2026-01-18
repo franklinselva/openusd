@@ -8,9 +8,11 @@
 //! - `usdz` - Archive format (.usdz) handler
 //! - `composition` - Layer composition (sublayers, references, payloads)
 //! - `shade` - Material and shader schema parsing
+//! - `mtlx` - MaterialX (.mtlx) XML format parser
 
 pub mod composition;
 pub mod expr;
+pub mod mtlx;
 pub mod sdf;
 pub mod shade;
 pub mod usda;

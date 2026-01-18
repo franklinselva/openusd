@@ -18,6 +18,8 @@ num-traits = "0.2.17"
 half = { version = "2.3.1", features = ["bytemuck", "num-traits"] }
 logos = "0.16.0"
 zip = { version = "7.0.0", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"  # For MaterialX (.mtlx) XML parsing
+log = "0.4"  # Logging
 
 # CLI validation tool dependencies
 clap = { version = "4", features = ["derive"], optional = true }

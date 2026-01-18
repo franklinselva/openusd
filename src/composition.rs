@@ -469,10 +469,11 @@ impl ComposedLayer {
     /// For each prim with a `references` field, load the referenced layer,
     /// find the target prim, and merge its content under the referencing prim.
     fn compose_references(specs: &mut HashMap<SdfPath, Spec>, base_dir: &Path, ctx: &mut CompositionContext) {
-        // Collect all prims that have references (to avoid borrowing issues)
+        // Collect all prims and variants that have references (to avoid borrowing issues)
+        // Both Prim and Variant specs can have references
         let prims_with_refs: Vec<(SdfPath, Vec<crate::sdf::Reference>)> = specs
             .iter()
-            .filter(|(_, spec)| spec.ty == SpecType::Prim)
+            .filter(|(_, spec)| spec.ty == SpecType::Prim || spec.ty == SpecType::Variant)
             .filter_map(|(path, spec)| {
                 let refs = Self::extract_references(spec);
                 if refs.is_empty() {
@@ -498,6 +499,12 @@ impl ComposedLayer {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
+
+                // Check if this is a MaterialX file
+                if resolved_path.extension().map_or(false, |ext| ext == "mtlx") {
+                    Self::compose_materialx_reference(specs, &resolved_path, &prim_path, &reference.prim_path);
+                    continue;
+                }
 
                 // Load the referenced layer
                 let ref_layer = match Self::open_recursive(&resolved_path, ctx) {
@@ -527,6 +534,341 @@ impl ComposedLayer {
                 );
             }
         }
+    }
+
+    /// Compose a MaterialX reference into USD-style specs.
+    ///
+    /// MaterialX files (.mtlx) contain material definitions in XML format.
+    /// This function parses them and creates corresponding USD Material, Shader,
+    /// and texture specs.
+    fn compose_materialx_reference(
+        specs: &mut HashMap<SdfPath, Spec>,
+        mtlx_path: &Path,
+        parent_path: &SdfPath,
+        _target_path: &SdfPath,
+    ) {
+        // Parse the MaterialX file
+        let mtlx_doc = match crate::mtlx::parse_mtlx_file(mtlx_path) {
+            Ok(doc) => doc,
+            Err(e) => {
+                log::warn!("Failed to parse MaterialX file {}: {}", mtlx_path.display(), e);
+                return;
+            }
+        };
+
+        let mtlx_base_dir = mtlx_path.parent().unwrap_or(Path::new("."));
+
+        log::debug!(
+            "Composing MaterialX: {} materials from {}",
+            mtlx_doc.materials.len(),
+            mtlx_path.display()
+        );
+
+        // Create specs for each material
+        for (mat_name, material) in &mtlx_doc.materials {
+            // Create Material prim
+            let mat_path: SdfPath = match parent_path.append_path(mat_name.as_str()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let mut mat_spec = Spec::new(SpecType::Prim);
+            mat_spec.fields.insert(
+                FieldKey::TypeName.as_str().to_string(),
+                Value::Token("Material".into()),
+            );
+            mat_spec.fields.insert(
+                FieldKey::Specifier.as_str().to_string(),
+                Value::Token("def".into()),
+            );
+
+            // Add primChildren for the shader
+            let shader_name = format!("{}_surface", mat_name);
+            mat_spec.fields.insert(
+                "primChildren".to_string(),
+                Value::TokenVec(vec![shader_name.clone()]),
+            );
+
+            specs.insert(mat_path.clone(), mat_spec);
+
+            // Find the shader this material uses
+            let shader = match mtlx_doc.get_shader(&material.shader_name) {
+                Some(s) => s,
+                None => {
+                    log::warn!("MaterialX material {} references unknown shader {}", mat_name, material.shader_name);
+                    continue;
+                }
+            };
+
+            // Create Shader prim (as UsdPreviewSurface equivalent)
+            let shader_path: SdfPath = match mat_path.append_path(shader_name.as_str()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let mut shader_spec = Spec::new(SpecType::Prim);
+            shader_spec.fields.insert(
+                FieldKey::TypeName.as_str().to_string(),
+                Value::Token("Shader".into()),
+            );
+            shader_spec.fields.insert(
+                FieldKey::Specifier.as_str().to_string(),
+                Value::Token("def".into()),
+            );
+
+            // Track texture prims to create
+            let mut texture_children: Vec<String> = Vec::new();
+
+            specs.insert(shader_path.clone(), shader_spec);
+
+            // Create info:id attribute (UsdPreviewSurface)
+            let info_id_path = match shader_path.append_property("info:id") {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut info_id_spec = Spec::new(SpecType::Attribute);
+            info_id_spec.fields.insert(
+                FieldKey::Default.as_str().to_string(),
+                Value::Token("UsdPreviewSurface".into()),
+            );
+            specs.insert(info_id_path, info_id_spec);
+
+            // Convert standard_surface inputs to UsdPreviewSurface inputs
+            Self::add_materialx_shader_inputs(
+                specs,
+                &shader_path,
+                &mat_path,
+                shader,
+                &mtlx_doc,
+                mtlx_base_dir,
+                &mut texture_children,
+            );
+
+            // Update shader's primChildren if we created textures
+            if !texture_children.is_empty() {
+                if let Some(shader_spec) = specs.get_mut(&shader_path) {
+                    shader_spec.fields.insert(
+                        "primChildren".to_string(),
+                        Value::TokenVec(texture_children),
+                    );
+                }
+            }
+
+            // Create outputs:surface for material binding
+            let surface_output_path = match mat_path.append_property("outputs:surface") {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut surface_output_spec = Spec::new(SpecType::Attribute);
+            // Connection to the shader's surface output
+            let connection_path = format!("{}/outputs:surface", shader_path.as_str());
+            surface_output_spec.fields.insert(
+                FieldKey::ConnectionPaths.as_str().to_string(),
+                Value::PathListOp(crate::sdf::ListOp {
+                    explicit: true,
+                    explicit_items: vec![SdfPath::new(&connection_path).unwrap_or_else(|_| SdfPath::abs_root())],
+                    ..Default::default()
+                }),
+            );
+            specs.insert(surface_output_path, surface_output_spec);
+
+            // Create shader's outputs:surface
+            let shader_surface_output = match shader_path.append_property("outputs:surface") {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let shader_surface_spec = Spec::new(SpecType::Attribute);
+            specs.insert(shader_surface_output, shader_surface_spec);
+        }
+    }
+
+    /// Add shader input attributes from MaterialX standard_surface.
+    fn add_materialx_shader_inputs(
+        specs: &mut HashMap<SdfPath, Spec>,
+        shader_path: &SdfPath,
+        mat_path: &SdfPath,
+        shader: &crate::mtlx::StandardSurface,
+        mtlx_doc: &crate::mtlx::MtlxDocument,
+        mtlx_base_dir: &Path,
+        texture_children: &mut Vec<String>,
+    ) {
+        // Map MaterialX standard_surface inputs to UsdPreviewSurface inputs
+
+        // Diffuse color
+        if let Some(input) = &shader.base_color {
+            Self::add_shader_input_from_mtlx(
+                specs, shader_path, mat_path, "inputs:diffuseColor",
+                input, mtlx_doc, mtlx_base_dir, texture_children, "diffuseTexture",
+            );
+        }
+
+        // Metallic
+        if let Some(input) = &shader.metalness {
+            Self::add_shader_input_from_mtlx(
+                specs, shader_path, mat_path, "inputs:metallic",
+                input, mtlx_doc, mtlx_base_dir, texture_children, "metallicTexture",
+            );
+        }
+
+        // Roughness (from specular_roughness)
+        if let Some(input) = &shader.specular_roughness {
+            Self::add_shader_input_from_mtlx(
+                specs, shader_path, mat_path, "inputs:roughness",
+                input, mtlx_doc, mtlx_base_dir, texture_children, "roughnessTexture",
+            );
+        }
+
+        // Normal
+        if let Some(input) = &shader.normal {
+            Self::add_shader_input_from_mtlx(
+                specs, shader_path, mat_path, "inputs:normal",
+                input, mtlx_doc, mtlx_base_dir, texture_children, "normalTexture",
+            );
+        }
+
+        // Emission
+        if let Some(input) = &shader.emission_color {
+            Self::add_shader_input_from_mtlx(
+                specs, shader_path, mat_path, "inputs:emissiveColor",
+                input, mtlx_doc, mtlx_base_dir, texture_children, "emissiveTexture",
+            );
+        }
+
+        // Opacity
+        if let Some(input) = &shader.opacity {
+            Self::add_shader_input_from_mtlx(
+                specs, shader_path, mat_path, "inputs:opacity",
+                input, mtlx_doc, mtlx_base_dir, texture_children, "opacityTexture",
+            );
+        }
+    }
+
+    /// Add a single shader input from MaterialX.
+    #[allow(clippy::too_many_arguments)]
+    fn add_shader_input_from_mtlx(
+        specs: &mut HashMap<SdfPath, Spec>,
+        shader_path: &SdfPath,
+        mat_path: &SdfPath,
+        input_name: &str,
+        input: &crate::mtlx::ShaderInput,
+        mtlx_doc: &crate::mtlx::MtlxDocument,
+        mtlx_base_dir: &Path,
+        texture_children: &mut Vec<String>,
+        texture_name: &str,
+    ) {
+        use crate::mtlx::{ShaderInput, ShaderValue};
+
+        let input_path = match shader_path.append_property(input_name) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let mut input_spec = Spec::new(SpecType::Attribute);
+
+        match input {
+            ShaderInput::Value(value) => {
+                // Direct value
+                match value {
+                    ShaderValue::Float(f) => {
+                        input_spec.fields.insert(
+                            FieldKey::Default.as_str().to_string(),
+                            Value::Float(*f),
+                        );
+                    }
+                    ShaderValue::Color3(rgb) => {
+                        input_spec.fields.insert(
+                            FieldKey::Default.as_str().to_string(),
+                            Value::Vec3f(rgb.to_vec()),
+                        );
+                    }
+                    ShaderValue::Vector3(v) => {
+                        input_spec.fields.insert(
+                            FieldKey::Default.as_str().to_string(),
+                            Value::Vec3f(v.to_vec()),
+                        );
+                    }
+                    ShaderValue::Color4(rgba) => {
+                        input_spec.fields.insert(
+                            FieldKey::Default.as_str().to_string(),
+                            Value::Vec4f(rgba.to_vec()),
+                        );
+                    }
+                }
+            }
+            ShaderInput::Connection { .. } | ShaderInput::NodeConnection { .. } => {
+                // Texture connection - resolve the texture path and create a texture prim
+                if let Some(tex_rel_path) = mtlx_doc.resolve_texture_path(input) {
+                    // Create texture prim
+                    let tex_path = mtlx_base_dir.join(&tex_rel_path);
+                    let tex_path_str = tex_path.to_string_lossy().to_string();
+
+                    // Create UsdUVTexture prim under the material
+                    let tex_prim_path: SdfPath = match mat_path.append_path(texture_name) {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+
+                    let mut tex_prim_spec = Spec::new(SpecType::Prim);
+                    tex_prim_spec.fields.insert(
+                        FieldKey::TypeName.as_str().to_string(),
+                        Value::Token("Shader".into()),
+                    );
+                    tex_prim_spec.fields.insert(
+                        FieldKey::Specifier.as_str().to_string(),
+                        Value::Token("def".into()),
+                    );
+                    specs.insert(tex_prim_path.clone(), tex_prim_spec);
+
+                    texture_children.push(texture_name.to_string());
+
+                    // Add info:id for UsdUVTexture
+                    if let Ok(tex_info_path) = tex_prim_path.append_property("info:id") {
+                        let mut tex_info_spec = Spec::new(SpecType::Attribute);
+                        tex_info_spec.fields.insert(
+                            FieldKey::Default.as_str().to_string(),
+                            Value::Token("UsdUVTexture".into()),
+                        );
+                        specs.insert(tex_info_path, tex_info_spec);
+                    }
+
+                    // Add inputs:file
+                    if let Ok(file_path) = tex_prim_path.append_property("inputs:file") {
+                        let mut file_spec = Spec::new(SpecType::Attribute);
+                        file_spec.fields.insert(
+                            FieldKey::Default.as_str().to_string(),
+                            Value::AssetPath(tex_path_str),
+                        );
+                        specs.insert(file_path, file_spec);
+                    }
+
+                    // Add outputs:rgb (or outputs:r for float textures)
+                    let output_name = if input_name.contains("metallic") ||
+                                        input_name.contains("roughness") ||
+                                        input_name.contains("opacity") {
+                        "outputs:r"
+                    } else {
+                        "outputs:rgb"
+                    };
+                    if let Ok(output_path) = tex_prim_path.append_property(output_name) {
+                        let output_spec = Spec::new(SpecType::Attribute);
+                        let output_path_clone: SdfPath = output_path.clone();
+                        specs.insert(output_path, output_spec);
+
+                        // Connect shader input to texture output
+                        input_spec.fields.insert(
+                            FieldKey::ConnectionPaths.as_str().to_string(),
+                            Value::PathListOp(crate::sdf::ListOp {
+                                explicit: true,
+                                explicit_items: vec![output_path_clone],
+                                ..Default::default()
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+
+        specs.insert(input_path, input_spec);
     }
 
     /// Compose an internal reference (reference to prim in same layer).
@@ -686,6 +1028,24 @@ impl ComposedLayer {
                 }
 
                 prim_spec.add("primChildren", Value::TokenVec(existing_children));
+            }
+        }
+
+        // Remap and add specs with variant selections
+        // These have paths like /Target{variantSet=variantName}/... and need to be
+        // remapped to /Prim{variantSet=variantName}/...
+        let target_variant_prefix = format!("{}{}", target_str, "{");
+        for (path, spec) in ref_specs.iter() {
+            let path_str = path.as_str();
+            if path_str.starts_with(&target_variant_prefix) {
+                // Remap the path by replacing the target prefix with the prim prefix
+                let relative_path = &path_str[target_str.len()..];
+                let new_path_str = format!("{}{}", prim_str, relative_path);
+                if let Ok(new_path) = SdfPath::new(&new_path_str) {
+                    let mut new_spec = spec.clone();
+                    Self::apply_layer_offset_to_spec(&mut new_spec, layer_offset);
+                    specs.entry(new_path).or_insert(new_spec);
+                }
             }
         }
     }
@@ -942,58 +1302,172 @@ impl ComposedLayer {
     /// For each prim with variant selections, compose fields from the selected
     /// variant into the prim. This includes properties and child prims defined
     /// within the variant.
+    ///
+    /// This function handles nested variants by iterating until no more variant
+    /// selections need to be processed.
     fn compose_variants(specs: &mut HashMap<SdfPath, Spec>) {
-        // Collect all prims that have variant selections
-        let prims_with_variants: Vec<(SdfPath, HashMap<String, String>)> = specs
-            .iter()
-            .filter(|(_, spec)| spec.ty == SpecType::Prim)
-            .filter_map(|(path, spec)| {
-                let selections = Self::extract_variant_selections(spec);
-                if selections.is_empty() {
-                    None
-                } else {
-                    Some((path.clone(), selections))
+        // Keep processing until no more variants need composition
+        // This handles nested variants (variants defined inside other variants)
+        let mut max_iterations = 10; // Prevent infinite loops
+        loop {
+            if max_iterations == 0 {
+                // Max iterations reached, possible infinite loop in variant composition
+                break;
+            }
+            max_iterations -= 1;
+
+            // Collect all prims that have variant selections
+            let prims_with_variants: Vec<(SdfPath, HashMap<String, String>)> = specs
+                .iter()
+                .filter(|(_, spec)| spec.ty == SpecType::Prim)
+                .filter_map(|(path, spec)| {
+                    let selections = Self::extract_variant_selections(spec);
+                    if selections.is_empty() {
+                        None
+                    } else {
+                        Some((path.clone(), selections))
+                    }
+                })
+                .collect();
+
+            if prims_with_variants.is_empty() {
+                break;
+            }
+
+            let mut composed_any = false;
+
+            // Process each prim with variants
+            for (prim_path, selections) in prims_with_variants {
+                // Process each variant selection
+                for (variant_set, selected_variant) in selections {
+                    // Build the variant path: /Prim{variantSet=variant}
+                    let variant_path = match prim_path.append_variant_selection(&variant_set, &selected_variant) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    // Check if the variant spec exists
+                    if !specs.contains_key(&variant_path) {
+                        continue;
+                    }
+
+                    composed_any = true;
+
+                    // Get fields from the variant spec (including nested variant selections)
+                    let variant_fields: HashMap<String, Value> = if let Some(variant_spec) = specs.get(&variant_path) {
+                        variant_spec
+                            .fields
+                            .iter()
+                            .filter(|(key, _)| {
+                                // Skip composition-specific fields but KEEP variantSelection
+                                *key != FieldKey::Specifier.as_str() && *key != "primChildren" && *key != "propertyChildren"
+                            })
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    } else {
+                        continue;
+                    };
+
+                    // Apply variant fields to the prim (local opinions still win)
+                    // This includes nested variant selections which will be processed in the next iteration
+                    if let Some(prim_spec) = specs.get_mut(&prim_path) {
+                        for (key, value) in variant_fields {
+                            // Special handling for variant selections - merge them instead of replacing
+                            if key == FieldKey::VariantSelection.as_str() {
+                                if let Value::VariantSelectionMap(new_map) = &value {
+                                    // Get existing selections or create new
+                                    let mut merged_map = prim_spec
+                                        .fields
+                                        .get(&key)
+                                        .and_then(|v| {
+                                            if let Value::VariantSelectionMap(m) = v {
+                                                Some(m.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or_default();
+
+                                    // Add new selections (existing selections win)
+                                    for (variant_set, selection) in new_map {
+                                        merged_map.entry(variant_set.clone()).or_insert(selection.clone());
+                                    }
+
+                                    prim_spec.fields.insert(key, Value::VariantSelectionMap(merged_map));
+                                }
+                            } else {
+                                prim_spec.fields.entry(key).or_insert(value);
+                            }
+                        }
+                    }
+
+                    // Compose properties from variant namespace into prim namespace
+                    Self::compose_variant_properties(specs, &prim_path, &variant_path);
+
+                    // Compose child prims from variant namespace into prim namespace
+                    Self::compose_variant_children(specs, &prim_path, &variant_path);
+
+                    // Also compose any nested variant sets defined in this variant
+                    Self::compose_nested_variant_sets(specs, &prim_path, &variant_path);
                 }
+            }
+
+            if !composed_any {
+                break;
+            }
+        }
+    }
+
+    /// Compose nested variant sets from a variant into the parent prim.
+    ///
+    /// When a variant defines variant sets (e.g., modelVariant contains shadingVariant),
+    /// those variant sets and their content need to be composed into the prim namespace.
+    /// This includes:
+    /// - Variant specs themselves (for further composition)
+    /// - All prims, properties, and relationships defined inside nested variants
+    fn compose_nested_variant_sets(specs: &mut HashMap<SdfPath, Spec>, prim_path: &SdfPath, variant_path: &SdfPath) {
+        let variant_str = variant_path.as_str();
+        let prim_str = prim_path.as_str();
+
+        // Find ALL specs nested under this variant that have additional variant selections
+        // This includes variant specs, prims inside variants, and properties
+        // Pattern: /Prim{var=sel}{nestedVar=nestedSel}/... -> /Prim{nestedVar=nestedSel}/...
+        let specs_to_translate: Vec<(SdfPath, Spec)> = specs
+            .iter()
+            .filter(|(path, _)| {
+                let path_str = path.as_str();
+                // Must start with variant path and have additional content after
+                if !path_str.starts_with(variant_str) || path_str.len() <= variant_str.len() {
+                    return false;
+                }
+                // The suffix must contain another variant selection
+                let suffix = &path_str[variant_str.len()..];
+                suffix.contains('{')
+            })
+            .map(|(path, spec)| {
+                // Translate the path by removing the outer variant selection
+                // /Prim{outer=sel}{inner=val}/Child -> /Prim{inner=val}/Child
+                // /Prim{outer=sel}{inner=val}/Child.prop -> /Prim{inner=val}/Child.prop
+                let suffix = &path.as_str()[variant_str.len()..];
+                let new_path_str = format!("{}{}", prim_str, suffix);
+                let new_path = SdfPath::new(&new_path_str).unwrap_or_else(|_| path.clone());
+                (new_path, spec.clone())
             })
             .collect();
 
-        // Process each prim with variants
-        for (prim_path, selections) in prims_with_variants {
-            // Process each variant selection
-            for (variant_set, selected_variant) in selections {
-                // Build the variant path: /Prim{variantSet=variant}
-                let variant_path = match prim_path.append_variant_selection(&variant_set, &selected_variant) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-
-                // Get fields from the variant spec
-                let variant_fields: HashMap<String, Value> = if let Some(variant_spec) = specs.get(&variant_path) {
-                    variant_spec
-                        .fields
-                        .iter()
-                        .filter(|(key, _)| {
-                            // Skip composition-specific fields
-                            *key != FieldKey::Specifier.as_str() && *key != "primChildren" && *key != "propertyChildren"
-                        })
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                } else {
-                    continue;
-                };
-
-                // Apply variant fields to the prim (local opinions still win)
-                if let Some(prim_spec) = specs.get_mut(&prim_path) {
-                    for (key, value) in variant_fields {
-                        prim_spec.fields.entry(key).or_insert(value);
+        // Add translated specs to the main namespace
+        for (new_path, spec) in specs_to_translate {
+            match specs.entry(new_path) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Merge fields (existing wins over new)
+                    let existing = entry.get_mut();
+                    for (key, value) in spec.fields {
+                        existing.fields.entry(key).or_insert(value);
                     }
                 }
-
-                // Compose properties from variant namespace into prim namespace
-                Self::compose_variant_properties(specs, &prim_path, &variant_path);
-
-                // Compose child prims from variant namespace into prim namespace
-                Self::compose_variant_children(specs, &prim_path, &variant_path);
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(spec);
+                }
             }
         }
     }
@@ -1013,9 +1487,20 @@ impl ComposedLayer {
             })
             .collect();
 
-        // Add properties (local opinions win)
-        for (prop_path, prop_spec) in properties_to_add {
-            specs.entry(prop_path).or_insert(prop_spec);
+        // Add properties, merging with existing (local opinions win over variant)
+        for (prop_path, variant_prop_spec) in properties_to_add {
+            match specs.entry(prop_path) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Merge variant property fields into existing spec
+                    let existing_spec = entry.get_mut();
+                    for (field_key, field_value) in variant_prop_spec.fields {
+                        existing_spec.fields.entry(field_key).or_insert(field_value);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(variant_prop_spec);
+                }
+            }
         }
     }
 
@@ -1050,9 +1535,24 @@ impl ComposedLayer {
             })
             .collect();
 
-        // Add all specs (local opinions win)
-        for (path, spec) in all_specs_to_add {
-            specs.entry(path).or_insert(spec);
+        // Add all specs, merging with existing specs when present.
+        // This is critical for `over` statements inside variants which overlay
+        // attributes onto existing prims (e.g., material:binding on Geometry).
+        // Variant opinions are weaker than local, so existing fields win.
+        for (path, variant_spec) in all_specs_to_add {
+            match specs.entry(path) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Merge variant spec fields into existing spec (existing fields win)
+                    let existing_spec = entry.get_mut();
+                    for (field_key, field_value) in variant_spec.fields {
+                        // Only add if the field doesn't already exist (weaker opinion)
+                        existing_spec.fields.entry(field_key).or_insert(field_value);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(variant_spec);
+                }
+            }
         }
 
         // Update prim children list
@@ -2481,5 +2981,239 @@ def Xform "Model" (
         );
 
         cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_nested_variant_selection() {
+        // This test mirrors the Teapot structure where:
+        // - modelVariant="Utah" variant has variants = { string shadingVariant = "..." }
+        // - Inside Utah variant, there's a nested shadingVariant variantSet
+        let temp_dir = create_temp_dir();
+
+        let root_path = temp_dir.join("nested_variants.usda");
+        fs::write(
+            &root_path,
+            r#"#usda 1.0
+
+def Xform "Model" (
+    variants = {
+        string modelVariant = "TypeA"
+    }
+    prepend variantSets = "modelVariant"
+)
+{
+    variantSet "modelVariant" = {
+        "TypeA" (
+            variants = {
+                string colorVariant = "Red"
+            }
+            prepend variantSets = "colorVariant"
+        ) {
+            def Scope "Materials"
+            {
+                def Material "RedMaterial"
+                {
+                    string name = "Red"
+                }
+            }
+            variantSet "colorVariant" = {
+                "Red" {
+                    over "Geometry" (
+                        prepend apiSchemas = ["MaterialBindingAPI"]
+                    )
+                    {
+                        rel material:binding = </Model/Materials/RedMaterial>
+                    }
+                }
+                "Blue" {
+                    over "Geometry"
+                    {
+                        rel material:binding = </Model/Materials/BlueMaterial>
+                    }
+                }
+            }
+        }
+        "TypeB" {
+            double attr = 1.0
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let composed = ComposedLayer::open(&root_path).unwrap();
+
+        // Check that /Model has the modelVariant selection
+        let model_path = sdf::path("/Model").unwrap();
+        let model_spec = composed.specs.get(&model_path).expect("Model should exist");
+        let model_variant_selection = model_spec
+            .fields
+            .get("variantSelection")
+            .expect("Model should have variantSelection");
+        if let Value::VariantSelectionMap(map) = model_variant_selection {
+            assert_eq!(map.get("modelVariant"), Some(&"TypeA".to_string()));
+        }
+
+        // Check that the TypeA variant spec has the colorVariant selection
+        let type_a_path = sdf::path("/Model{modelVariant=TypeA}").unwrap();
+        let type_a_spec = composed.specs.get(&type_a_path).expect("TypeA variant should exist");
+        let nested_selection = type_a_spec.fields.get("variantSelection");
+
+        // The TypeA variant should have variantSelection with colorVariant = Red
+        if let Some(Value::VariantSelectionMap(map)) = nested_selection {
+            assert_eq!(
+                map.get("colorVariant"),
+                Some(&"Red".to_string()),
+                "TypeA variant should select colorVariant=Red"
+            );
+        } else {
+            panic!("TypeA variant should have variantSelection field!");
+        }
+
+        // The key test: Does the Geometry material binding get composed to /Model/Geometry?
+        let binding_path = sdf::path("/Model/Geometry.material:binding").unwrap();
+        assert!(
+            composed.specs.contains_key(&binding_path),
+            "material:binding should be composed from nested variant to /Model/Geometry"
+        );
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_teapot_material_binding() {
+        // Test the actual Teapot USD file - this has nested variants that must be composed:
+        // - modelVariant="Utah" variant has shadingVariant="CeramicLimeGreen"
+        // - Inside the shadingVariant, there's an "over Geometry" with material:binding
+        // - The material:binding should be composed to /Teapot/Geometry.material:binding
+        let teapot_path = Path::new("vendor/usd-wg-assets/full_assets/Teapot/Teapot.usd");
+        if !teapot_path.exists() {
+            // Skip test if asset not found
+            return;
+        }
+
+        let composed = ComposedLayer::open(teapot_path).unwrap();
+
+        // Check that /Teapot/Geometry.material:binding exists
+        let binding_path = sdf::path("/Teapot/Geometry.material:binding").unwrap();
+        assert!(
+            composed.specs.contains_key(&binding_path),
+            "Teapot should have /Teapot/Geometry.material:binding composed from nested variants"
+        );
+
+        // Check that /Teapot/Geometry has typeName=Mesh (loaded from reference)
+        let geometry_path = sdf::path("/Teapot/Geometry").unwrap();
+        let geometry_spec = composed.specs.get(&geometry_path).expect("Geometry prim should exist");
+        let type_name = geometry_spec
+            .fields
+            .get("typeName")
+            .expect("Geometry should have typeName");
+        assert!(
+            matches!(type_name, Value::Token(t) if t == "Mesh"),
+            "Geometry should be a Mesh type, got {:?}",
+            type_name
+        );
+    }
+
+    #[test]
+    fn test_chess_set_composition() {
+        // Test the Chess Set - uses 'add references' to include pieces
+        let chess_path = Path::new("vendor/usd-wg-assets/full_assets/OpenChessSet/chess_set.usda");
+        if !chess_path.exists() {
+            return;
+        }
+
+        let composed = ComposedLayer::open(chess_path).unwrap();
+
+        // Count mesh prims
+        let mesh_count = composed
+            .specs
+            .iter()
+            .filter(|(_, spec)| {
+                spec.ty == SpecType::Prim
+                    && spec
+                        .fields
+                        .get("typeName")
+                        .map(|v| matches!(v, Value::Token(t) if t == "Mesh"))
+                        .unwrap_or(false)
+            })
+            .count();
+
+        println!("Chess Set: {} mesh prims found", mesh_count);
+
+        // Check root primChildren
+        let root_path = SdfPath::abs_root();
+        if let Some(spec) = composed.specs.get(&root_path) {
+            if let Some(children) = spec.fields.get("primChildren") {
+                println!("Root (/) primChildren: {:?}", children);
+            } else {
+                println!("Root (/) has NO primChildren field!");
+            }
+        } else {
+            println!("Root (/) spec NOT FOUND!");
+        }
+
+        // Check primChildren for key prims
+        let chess_set_path = sdf::path("/ChessSet").unwrap();
+        if let Some(spec) = composed.specs.get(&chess_set_path) {
+            if let Some(children) = spec.fields.get("primChildren") {
+                println!("/ChessSet primChildren: {:?}", children);
+            } else {
+                println!("/ChessSet has NO primChildren field!");
+            }
+        }
+
+        let black_path = sdf::path("/ChessSet/Black").unwrap();
+        if let Some(spec) = composed.specs.get(&black_path) {
+            if let Some(children) = spec.fields.get("primChildren") {
+                println!("/ChessSet/Black primChildren: {:?}", children);
+            } else {
+                println!("/ChessSet/Black has NO primChildren field!");
+            }
+        }
+
+        let king_path = sdf::path("/ChessSet/Black/King").unwrap();
+        if let Some(spec) = composed.specs.get(&king_path) {
+            if let Some(children) = spec.fields.get("primChildren") {
+                println!("/ChessSet/Black/King primChildren: {:?}", children);
+            } else {
+                println!("/ChessSet/Black/King has NO primChildren field!");
+            }
+            // Check for references field
+            if let Some(refs) = spec.fields.get("references") {
+                println!("/ChessSet/Black/King references: {:?}", refs);
+            }
+            // Check for variantSelection
+            if let Some(vs) = spec.fields.get("variantSelection") {
+                println!("/ChessSet/Black/King variantSelection: {:?}", vs);
+            }
+        }
+
+        // Check King/Geom path
+        let geom_path = sdf::path("/ChessSet/Black/King/Geom").unwrap();
+        if let Some(spec) = composed.specs.get(&geom_path) {
+            println!("/ChessSet/Black/King/Geom exists with type: {:?}", spec.fields.get("typeName"));
+            if let Some(children) = spec.fields.get("primChildren") {
+                println!("/ChessSet/Black/King/Geom primChildren: {:?}", children);
+            }
+        } else {
+            println!("/ChessSet/Black/King/Geom NOT FOUND in specs!");
+        }
+
+        // Check King/Geom/Render path
+        let render_path = sdf::path("/ChessSet/Black/King/Geom/Render").unwrap();
+        if let Some(spec) = composed.specs.get(&render_path) {
+            println!("/ChessSet/Black/King/Geom/Render exists with type: {:?}", spec.fields.get("typeName"));
+        } else {
+            println!("/ChessSet/Black/King/Geom/Render NOT FOUND in specs!");
+        }
+
+        // Chess set should have multiple meshes (21 expected)
+        assert!(
+            mesh_count >= 20,
+            "Chess Set should have at least 20 meshes, got {}",
+            mesh_count
+        );
     }
 }
